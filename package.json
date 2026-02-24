@@ -1,0 +1,19 @@
+{
+  "name": "aws-calculator-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for creating AWS Pricing Calculator estimates with shareable links",
+  "type": "module",
+  "bin": { "aws-calculator-mcp": "./index.js" },
+  "license": "MIT",
+  "author": "Musheer360",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Musheer360/aws-calculator-mcp"
+  },
+  "keywords": ["mcp", "aws", "pricing", "calculator", "estimate"],
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.25.0"
+  }
+}
