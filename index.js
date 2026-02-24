@@ -35,7 +35,7 @@ function extractInputs(def) {
   function walkComponents(comps) {
     for (const comp of comps || []) {
       if (comp.id) {
-        inputs.push({
+        const field = {
           id: comp.id,
           label: comp.label,
           type: comp.subType || comp.type,
@@ -43,7 +43,19 @@ function extractInputs(def) {
           default: comp.defaultValue ?? comp.value ?? null,
           unit: comp.unit || null,
           options: comp.options?.map((o) => o.label || o.value) || null,
-        });
+        };
+        
+        // Issue 5 & 6: Add format hints for frequency/fileSize types
+        if (field.type === "frequency" || field.type === "fileSize") {
+          if (comp.unitOptions) {
+            field.unitOptions = comp.unitOptions;
+            field.format = "value with unit selector";
+          } else if (field.unit) {
+            field.format = `value in ${field.unit}`;
+          }
+        }
+        
+        inputs.push(field);
       }
       if (comp.components) walkComponents(comp.components);
     }
@@ -57,26 +69,25 @@ function extractInputs(def) {
   return inputs;
 }
 
-// Build calculationComponents from user inputs + service definition defaults
+// Issue 2: Build calculationComponents - only include meaningful defaults
 function buildCalcComponents(inputs, userInputs = {}) {
   const cc = {};
-  for (const inp of inputs) {
-    if (inp.id) {
-      const val = userInputs[inp.id] ?? inp.default ?? "";
-      // Check if already wrapped in {value: ...} format
-      if (typeof val === "object" && val !== null && "value" in val) {
-        cc[inp.id] = val;
-      } else {
-        cc[inp.id] = { value: val };
-      }
-    }
-  }
-  // Merge any extra user inputs not in the definition
-  for (const [k, v] of Object.entries(userInputs)) {
-    if (!cc[k]) {
+  
+  // If user provided inputs, use them
+  if (userInputs && Object.keys(userInputs).length > 0) {
+    for (const [k, v] of Object.entries(userInputs)) {
       cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
     }
+    return cc;
   }
+  
+  // Otherwise, only include fields with meaningful defaults (not empty/null)
+  for (const inp of inputs) {
+    if (inp.id && inp.default != null && inp.default !== "") {
+      cc[inp.id] = { value: inp.default };
+    }
+  }
+  
   return cc;
 }
 
@@ -126,6 +137,11 @@ server.tool(
       inputs,
     };
     
+    // Issue 4: Add note for loader layout services
+    if (def.layout === "loader" && inputs.length === 0) {
+      result.note = "This service uses dynamic loading (layout: 'loader'). calculationComponents cannot be auto-populated and should be omitted when creating estimates.";
+    }
+    
     // Fetch subService schemas if they exist
     if (def.subServices?.length) {
       for (const sub of def.subServices) {
@@ -158,7 +174,8 @@ server.tool(
   "create_estimate",
   `Create an AWS Pricing Calculator estimate and return a shareable link.
 Each service needs: serviceCode, region, serviceName, monthlyCost.
-Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.`,
+Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.
+Optionally provide a 'group' name for each service to organize them into groups.`,
   {
     name: z.string().describe("Estimate name"),
     services: z
@@ -173,28 +190,21 @@ Optionally provide calculationComponents (key-value pairs from get_service_schem
           upfrontCost: z.number().default(0).describe("Upfront cost in USD"),
           configSummary: z.string().optional().describe("Brief config summary shown in the estimate table"),
           calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
+          group: z.string().optional().describe("Group name to organize this service under"),
         })
       )
       .describe("Array of services to include"),
-    groups: z
-      .record(
-        z.object({
-          name: z.string(),
-          serviceKeys: z.array(z.string()).describe("Service keys to include in this group"),
-        })
-      )
-      .optional()
-      .describe("Optional groups to organize services"),
   },
-  async ({ name, services, groups }) => {
+  async ({ name, services }) => {
     const svcMap = {};
+    const groupMap = {}; // Track which services belong to which groups
     let totalMonthly = 0, totalUpfront = 0;
 
     for (const svc of services) {
       const key = `${svc.serviceCode}-${crypto.randomUUID()}`;
       let cc = {};
 
-      // If user provided calculationComponents, wrap values properly
+      // Issue 2: If user provided calculationComponents, use them as-is
       if (svc.calculationComponents) {
         for (const [k, v] of Object.entries(svc.calculationComponents)) {
           cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
@@ -265,24 +275,28 @@ Optionally provide calculationComponents (key-value pairs from get_service_schem
       svcMap[key] = entry;
       totalMonthly += svc.monthlyCost;
       totalUpfront += svc.upfrontCost || 0;
+      
+      // Issue 1: Track group membership
+      if (svc.group) {
+        if (!groupMap[svc.group]) groupMap[svc.group] = [];
+        groupMap[svc.group].push(key);
+      }
     }
 
-    // Build groups structure
-    const groupsMap = {};
-    if (groups) {
-      for (const [groupKey, groupData] of Object.entries(groups)) {
-        const groupId = `group-${crypto.randomUUID()}`;
-        groupsMap[groupId] = {
-          name: groupData.name,
-          services: groupData.serviceKeys,
-        };
-      }
+    // Issue 1: Build groups structure from groupMap
+    const groupsObj = {};
+    for (const [groupName, serviceKeys] of Object.entries(groupMap)) {
+      const groupId = `group-${crypto.randomUUID()}`;
+      groupsObj[groupId] = {
+        name: groupName,
+        services: serviceKeys,
+      };
     }
 
     const payload = {
       name,
       services: svcMap,
-      groups: groupsMap,
+      groups: groupsObj,
       groupSubtotal: { monthly: totalMonthly, upfront: totalUpfront },
       totalCost: { monthly: totalMonthly, upfront: totalUpfront },
       support: {},
@@ -294,19 +308,57 @@ Optionally provide calculationComponents (key-value pairs from get_service_schem
       },
     };
 
-    const resp = await fetch(API.save, {
+    // Issue 2 & 3: Try with calculationComponents first, fallback without them
+    let resp = await fetch(API.save, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     
+    let respText = await resp.text();
+    let warnings = [];
+    
+    // Issue 3: Better error handling with response body
     if (!resp.ok) {
-      throw new Error(`Failed to save estimate: ${resp.status} ${resp.statusText}`);
+      // Issue 2: Fallback - strip calculationComponents and retry
+      const strippedServices = [];
+      for (const [key, svc] of Object.entries(payload.services)) {
+        if (Object.keys(svc.calculationComponents || {}).length > 0) {
+          strippedServices.push(svc.serviceName);
+        }
+        svc.calculationComponents = {};
+        if (svc.subServices) {
+          for (const sub of svc.subServices) {
+            sub.calculationComponents = {};
+          }
+        }
+      }
+      
+      const retryResp = await fetch(API.save, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      
+      const retryText = await retryResp.text();
+      
+      if (!retryResp.ok) {
+        throw new Error(`Failed to save estimate: ${resp.status} ${resp.statusText}. Response: ${respText}. Retry also failed: ${retryResp.status} ${retryText}`);
+      }
+      
+      // Issue 7: Provide feedback on what was stripped
+      warnings.push(`⚠️  Original attempt with calculationComponents failed (${resp.status}: ${respText.substring(0, 200)}). Retried without calculationComponents — estimate saved successfully but service configurations won't render in detail.`);
+      if (strippedServices.length > 0) {
+        warnings.push(`Services with stripped components: ${strippedServices.join(", ")}`);
+      }
+      
+      resp = retryResp;
+      respText = retryText;
     }
     
-    const result = await resp.json();
+    const result = JSON.parse(respText);
     if (result.statusCode !== 201 || !result.body) {
-      throw new Error(`Save API returned unexpected response: ${JSON.stringify(result)}`);
+      throw new Error(`Save API returned unexpected response: ${respText}`);
     }
     
     const body = JSON.parse(result.body);
@@ -316,20 +368,36 @@ Optionally provide calculationComponents (key-value pairs from get_service_schem
     
     const url = `https://calculator.aws/#/estimate?id=${body.savedKey}`;
 
+    const output = [
+      `✅ Estimate "${name}" saved successfully!`,
+      "",
+      `🔗 Shareable link: ${url}`,
+      "",
+      `Monthly: $${totalMonthly.toFixed(2)} | Upfront: $${totalUpfront.toFixed(2)} | 12-month: $${(totalMonthly * 12 + totalUpfront).toFixed(2)}`,
+      "",
+    ];
+    
+    if (Object.keys(groupsObj).length > 0) {
+      output.push(`Groups: ${Object.values(groupsObj).map(g => g.name).join(", ")}`);
+      output.push("");
+    }
+    
+    output.push(`Services: ${services.length}`);
+    for (const s of services) {
+      const groupLabel = s.group ? ` [${s.group}]` : "";
+      output.push(`  • ${s.serviceName} (${s.region}): $${s.monthlyCost.toFixed(2)}/mo${groupLabel}`);
+    }
+    
+    if (warnings.length > 0) {
+      output.push("");
+      output.push(...warnings);
+    }
+
     return {
       content: [
         {
           type: "text",
-          text: [
-            `✅ Estimate "${name}" saved successfully!`,
-            "",
-            `🔗 Shareable link: ${url}`,
-            "",
-            `Monthly: $${totalMonthly.toFixed(2)} | Upfront: $${totalUpfront.toFixed(2)} | 12-month: $${(totalMonthly * 12 + totalUpfront).toFixed(2)}`,
-            "",
-            `Services: ${services.length}`,
-            ...services.map((s) => `  • ${s.serviceName} (${s.region}): $${s.monthlyCost.toFixed(2)}/mo`),
-          ].join("\n"),
+          text: output.join("\n"),
         },
       ],
     };
