@@ -146,6 +146,16 @@ The calculation engine supports:
 - **Free tier deductions**: proper free tier handling (e.g., Lambda free 1M requests + 400K GB-seconds)
 - **Unit conversions**: MB↔GB↔TB for storage, per-second↔per-month for frequencies
 - **Conditional pricing**: `displayIf` conditions for feature-specific pricing (e.g., Lambda ARM vs x86)
+- **Savings plans / pricing strategies**: EC2 pricing model selection (Instance Savings Plans, Compute Savings Plans, Reserved, On-Demand)
+
+### Editability
+
+Estimates are fully editable when opened in the browser. The server includes:
+- `templateId`: tells the calculator which configuration form to show (e.g., "lambdaWithFreeTier", "CDN", "quickEstimate")
+- `calculationComponents`: all input field values that populate the edit form
+- `version`: matching service definition version to prevent stale data warnings
+
+Services with multiple templates (e.g., Lambda "Include Free Tier" vs "Without Free Tier", CloudFront "Flat Rate" vs "Pay as you go") default to the first template. Use the `templateId` parameter in `create_estimate` to select a specific template.
 
 ## Limitations
 

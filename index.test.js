@@ -33,6 +33,28 @@ function extractInputs(def) {
           }
         }
         
+        // Handle pricingStrategy components (e.g., EC2 savings plans)
+        if (comp.subType === "pricingStrategy" && comp.radioGroups?.length > 0) {
+          const defaultVal = {};
+          for (const rg of comp.radioGroups) {
+            defaultVal[rg.value] = rg.defaultOption;
+          }
+          field.default = defaultVal;
+          field.radioGroups = comp.radioGroups.map(rg => ({
+            label: rg.label,
+            key: rg.value,
+            defaultOption: rg.defaultOption,
+            options: rg.options?.map(o => ({ label: o.label, value: o.value })) || [],
+          }));
+          field.format = "object with keys: " + comp.radioGroups.map(rg => rg.value).join(", ");
+        }
+        
+        // Handle radioTiles components (e.g., EC2 advanced pricing strategy)
+        if (comp.subType === "radioTiles" && comp.radioOptions?.length > 0) {
+          field.default = comp.defaultSelection || null;
+          field.options = comp.radioOptions.map(o => ({ label: o.label, value: o.value, description: o.description }));
+        }
+        
         inputs.push(field);
       }
       if (comp.components) walkComponents(comp.components);
@@ -59,6 +81,10 @@ function resolveValue(input, rawValue) {
 
 function buildComponentValue(input, value) {
   if (!input) return { value };
+  // pricingStrategy values are stored as plain objects (e.g., { model: "instanceSavings", term: "1yr", options: "NoUpfront" })
+  if (input.type === "pricingStrategy" && typeof value === "object" && value !== null && !("value" in value)) {
+    return value;
+  }
   if ((input.type === "frequency" || input.type === "fileSize") && input.defaultUnit) {
     return { value, unit: input.defaultUnit };
   }
@@ -79,12 +105,14 @@ function buildCalcComponents(inputs, userInputs = {}) {
       }
     }
     for (const [k, v] of Object.entries(userInputs)) {
-      if (typeof v === "object" && v !== null && "value" in v) {
-        const inp = inputMap[k];
+      const inp = inputMap[k];
+      // pricingStrategy values are always stored as plain objects
+      if (inp?.type === "pricingStrategy" && typeof v === "object" && v !== null) {
+        cc[k] = "value" in v ? v.value : v;
+      } else if (typeof v === "object" && v !== null && "value" in v) {
         const resolved = inp ? resolveValue(inp, v.value) : v.value;
         cc[k] = { ...v, value: resolved };
       } else {
-        const inp = inputMap[k];
         const resolved = inp ? resolveValue(inp, v) : v;
         cc[k] = buildComponentValue(inp, resolved);
       }
@@ -323,6 +351,73 @@ describe("extractInputs", () => {
     assert.deepEqual(extractInputs({ templates: [] }), []);
     assert.deepEqual(extractInputs({ templates: [{ cards: [] }] }), []);
   });
+
+  it("should extract pricingStrategy with radioGroups defaults", () => {
+    const def = {
+      templates: [{
+        cards: [{
+          inputSection: {
+            components: [{
+              id: "pricingStrategy",
+              type: "input",
+              subType: "pricingStrategy",
+              label: "Pricing strategy",
+              radioGroups: [
+                { label: "Pricing model", value: "model", defaultOption: "instanceSavings", options: [
+                  { label: "Instance Savings Plans", value: "instanceSavings" },
+                  { label: "On-Demand", value: "ondemand" },
+                ]},
+                { label: "Term", value: "term", defaultOption: "1yr", options: [
+                  { label: "1 Year", value: "1yr" },
+                  { label: "3 Year", value: "3yr" },
+                ]},
+                { label: "Payment", value: "options", defaultOption: "NoUpfront", options: [
+                  { label: "No Upfront", value: "NoUpfront" },
+                  { label: "All Upfront", value: "AllUpfront" },
+                ]},
+              ],
+            }],
+          },
+        }],
+      }],
+    };
+    
+    const inputs = extractInputs(def);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0].type, "pricingStrategy");
+    assert.deepEqual(inputs[0].default, { model: "instanceSavings", term: "1yr", options: "NoUpfront" });
+    assert.equal(inputs[0].radioGroups.length, 3);
+    assert.equal(inputs[0].format, "object with keys: model, term, options");
+  });
+
+  it("should extract radioTiles with default selection", () => {
+    const def = {
+      templates: [{
+        cards: [{
+          inputSection: {
+            components: [{
+              id: "pricingStrategySelection",
+              type: "input",
+              subType: "radioTiles",
+              label: "Pricing strategy selection",
+              defaultSelection: "instance-savings",
+              radioOptions: [
+                { label: "Instance Savings Plans", value: "instance-savings", description: "Discount on instance family" },
+                { label: "On-Demand", value: "on-demand", description: "Pay per use" },
+              ],
+            }],
+          },
+        }],
+      }],
+    };
+    
+    const inputs = extractInputs(def);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0].type, "radioTiles");
+    assert.equal(inputs[0].default, "instance-savings");
+    assert.equal(inputs[0].options.length, 2);
+    assert.equal(inputs[0].options[0].value, "instance-savings");
+  });
 });
 
 describe("resolveValue", () => {
@@ -381,6 +476,12 @@ describe("buildComponentValue", () => {
 
   it("should handle null input", () => {
     assert.deepEqual(buildComponentValue(null, "test"), { value: "test" });
+  });
+
+  it("should pass pricingStrategy objects through without wrapping", () => {
+    const input = { id: "pricingStrategy", type: "pricingStrategy" };
+    const value = { model: "instanceSavings", term: "1yr", options: "NoUpfront" };
+    assert.deepEqual(buildComponentValue(input, value), { model: "instanceSavings", term: "1yr", options: "NoUpfront" });
   });
 });
 
@@ -461,6 +562,29 @@ describe("buildCalcComponents", () => {
     const cc = buildCalcComponents(inputs, {});
     // Empty object should be treated as no user inputs → use defaults
     assert.deepEqual(cc.region, { value: "us-east-1" });
+  });
+
+  it("should include pricingStrategy defaults as plain objects", () => {
+    const pricingInputs = [
+      { id: "pricingStrategy", type: "pricingStrategy", default: { model: "instanceSavings", term: "1yr", options: "NoUpfront" } },
+      { id: "quantity", type: "numericInput", default: 1 },
+    ];
+    const cc = buildCalcComponents(pricingInputs);
+    // pricingStrategy should be stored as plain object, not wrapped in { value: ... }
+    assert.deepEqual(cc.pricingStrategy, { model: "instanceSavings", term: "1yr", options: "NoUpfront" });
+    assert.deepEqual(cc.quantity, { value: 1 });
+  });
+
+  it("should allow overriding pricingStrategy with user inputs", () => {
+    const pricingInputs = [
+      { id: "pricingStrategy", type: "pricingStrategy", default: { model: "instanceSavings", term: "1yr", options: "NoUpfront" } },
+    ];
+    const userInputs = {
+      pricingStrategy: { model: "ondemand" },
+    };
+    const cc = buildCalcComponents(pricingInputs, userInputs);
+    // User override should be stored directly
+    assert.deepEqual(cc.pricingStrategy, { model: "ondemand" });
   });
 });
 

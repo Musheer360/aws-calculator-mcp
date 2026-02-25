@@ -97,6 +97,28 @@ function extractInputs(def) {
           }
         }
         
+        // Handle pricingStrategy components (e.g., EC2 savings plans)
+        if (comp.subType === "pricingStrategy" && comp.radioGroups?.length > 0) {
+          const defaultVal = {};
+          for (const rg of comp.radioGroups) {
+            defaultVal[rg.value] = rg.defaultOption;
+          }
+          field.default = defaultVal;
+          field.radioGroups = comp.radioGroups.map(rg => ({
+            label: rg.label,
+            key: rg.value,
+            defaultOption: rg.defaultOption,
+            options: rg.options?.map(o => ({ label: o.label, value: o.value })) || [],
+          }));
+          field.format = "object with keys: " + comp.radioGroups.map(rg => rg.value).join(", ");
+        }
+        
+        // Handle radioTiles components (e.g., EC2 advanced pricing strategy)
+        if (comp.subType === "radioTiles" && comp.radioOptions?.length > 0) {
+          field.default = comp.defaultSelection || null;
+          field.options = comp.radioOptions.map(o => ({ label: o.label, value: o.value, description: o.description }));
+        }
+        
         inputs.push(field);
       }
       if (comp.components) walkComponents(comp.components);
@@ -140,13 +162,15 @@ function buildCalcComponents(inputs, userInputs = {}) {
     }
     // Then overlay user-provided values
     for (const [k, v] of Object.entries(userInputs)) {
-      if (typeof v === "object" && v !== null && "value" in v) {
+      const inp = inputMap[k];
+      // pricingStrategy values are always stored as plain objects
+      if (inp?.type === "pricingStrategy" && typeof v === "object" && v !== null) {
+        cc[k] = "value" in v ? v.value : v;
+      } else if (typeof v === "object" && v !== null && "value" in v) {
         // Already in { value, unit? } format - resolve label if applicable
-        const inp = inputMap[k];
         const resolved = inp ? resolveValue(inp, v.value) : v.value;
         cc[k] = { ...v, value: resolved };
       } else {
-        const inp = inputMap[k];
         const resolved = inp ? resolveValue(inp, v) : v;
         cc[k] = buildComponentValue(inp, resolved);
       }
@@ -167,6 +191,10 @@ function buildCalcComponents(inputs, userInputs = {}) {
 // Build a properly formatted component value including unit if needed
 function buildComponentValue(input, value) {
   if (!input) return { value };
+  // pricingStrategy values are stored as plain objects (e.g., { model: "instanceSavings", term: "1yr", options: "NoUpfront" })
+  if (input.type === "pricingStrategy" && typeof value === "object" && value !== null && !("value" in value)) {
+    return value;
+  }
   if ((input.type === "frequency" || input.type === "fileSize") && input.defaultUnit) {
     return { value, unit: input.defaultUnit };
   }
@@ -502,6 +530,7 @@ For frequency/fileSize fields, provide { value: number, unit: "unitString" }.`,
       serviceCode: def.serviceCode,
       version: def.version,
       layout: def.layout,
+      templates: (def.templates || []).map(t => ({ id: t.id, title: t.title })),
       subServices: [],
       inputs,
     };
@@ -555,6 +584,7 @@ Returns the calculated monthly/upfront costs and the formatted calculationCompon
     const allInputs = extractInputs(def);
     const cc = buildCalcComponents(allInputs, inputs);
     const result = await calculateServiceCost(serviceCode, region, inputs);
+    const templateId = def.templates?.[0]?.id || null;
 
     const lines = [`🔧 ${def.serviceName} (${REGION_NAMES[region] || region})`];
     if (result) {
@@ -578,18 +608,21 @@ Returns the calculated monthly/upfront costs and the formatted calculationCompon
     lines.push("", "calculationComponents (use in create_estimate):");
     lines.push(JSON.stringify(result?.calculationComponents || cc, null, 2));
 
+    const response = {
+      serviceName: def.serviceName,
+      serviceCode: def.serviceCode,
+      region,
+      monthlyCost: result?.monthly ?? 0,
+      upfrontCost: result?.upfront ?? 0,
+      calculationComponents: result?.calculationComponents || cc,
+      summary: lines.slice(0, 3).join("\n"),
+    };
+    if (templateId) response.templateId = templateId;
+
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({
-          serviceName: def.serviceName,
-          serviceCode: def.serviceCode,
-          region,
-          monthlyCost: result?.monthly ?? 0,
-          upfrontCost: result?.upfront ?? 0,
-          calculationComponents: result?.calculationComponents || cc,
-          summary: lines.slice(0, 3).join("\n"),
-        }, null, 2),
+        text: JSON.stringify(response, null, 2),
       }],
     };
   }
@@ -618,6 +651,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
           upfrontCost: z.number().default(0).describe("Upfront cost in USD"),
           configSummary: z.string().optional().describe("Brief config summary shown in the estimate table"),
           calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
+          templateId: z.string().optional().describe("Template ID for the service (auto-detected if not provided). Controls which configuration form is shown when editing."),
           group: z.string().optional().describe("Group name to organize this service under"),
         })
       )
@@ -634,11 +668,16 @@ Optionally provide a 'group' name for each service to organize them into groups.
 
       // Try to fetch service definition for version, structure, and input schema
       let version = "0.0.1", estimateFor = svc.serviceCode, subServices = undefined;
+      let templateId = svc.templateId || null;
       let inputs = [];
       try {
         const def = await fetchJSON(API.serviceDef(svc.serviceCode));
         version = def.version || version;
         estimateFor = def.estimateFor || def.serviceCode;
+        // Auto-detect templateId from service definition (use first template)
+        if (!templateId && def.templates?.length > 0) {
+          templateId = def.templates[0].id || null;
+        }
         inputs = extractInputs(def);
 
         // If service has subServices in its definition, build them properly
@@ -706,6 +745,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
         regionName: svc.regionName || REGION_NAMES[svc.region] || svc.region,
         configSummary: svc.configSummary || "",
       };
+      if (templateId) entry.templateId = templateId;
       if (subServices) entry.subServices = subServices;
 
       svcMap[key] = entry;
@@ -873,6 +913,7 @@ server.tool(
       serviceCode: s.serviceCode,
       region: s.region,
       regionName: s.regionName,
+      templateId: s.templateId || null,
       monthlyCost: s.serviceCost?.monthly || 0,
       upfrontCost: s.serviceCost?.upfront || 0,
       configSummary: s.configSummary,
@@ -887,7 +928,8 @@ server.tool(
       "",
       "Services:",
       ...services.map((s) => {
-        const editStatus = s.hasComponents ? "✅ editable" : "⚠️ no config data";
+        const editable = s.hasComponents && s.templateId;
+        const editStatus = editable ? "✅ editable" : s.hasComponents ? "⚠️ missing templateId" : "⚠️ no config data";
         return `  • ${s.serviceName} (${s.regionName}): $${s.monthlyCost.toFixed(2)}/mo [${editStatus}]`;
       }),
     ].join("\n");
