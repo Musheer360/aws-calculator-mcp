@@ -69,7 +69,8 @@ async function getManifest() {
 }
 
 // Extract input fields from a service definition's templates (fully recursive)
-function extractInputs(def) {
+// If templateId is provided, only extract from that specific template
+function extractInputs(def, templateId) {
   const inputs = [];
   
   function walkComponents(comps) {
@@ -125,7 +126,10 @@ function extractInputs(def) {
     }
   }
   
-  for (const tmpl of def.templates || []) {
+  const templates = templateId
+    ? (def.templates || []).filter(t => t.id === templateId)
+    : (def.templates || []);
+  for (const tmpl of templates) {
     for (const card of tmpl.cards || []) {
       walkComponents(card.inputSection?.components);
     }
@@ -678,7 +682,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
         if (!templateId && def.templates?.length > 0) {
           templateId = def.templates[0].id || null;
         }
-        inputs = extractInputs(def);
+        inputs = extractInputs(def, templateId);
 
         // If service has subServices in its definition, build them properly
         if (def.subServices?.length) {

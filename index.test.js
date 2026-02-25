@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 
 // ---- Replicate the pure functions from index.js for testing ----
 
-function extractInputs(def) {
+function extractInputs(def, templateId) {
   const inputs = [];
   
   function walkComponents(comps) {
@@ -61,7 +61,10 @@ function extractInputs(def) {
     }
   }
   
-  for (const tmpl of def.templates || []) {
+  const templates = templateId
+    ? (def.templates || []).filter(t => t.id === templateId)
+    : (def.templates || []);
+  for (const tmpl of templates) {
     for (const card of tmpl.cards || []) {
       walkComponents(card.inputSection?.components);
     }
@@ -417,6 +420,57 @@ describe("extractInputs", () => {
     assert.equal(inputs[0].default, "instance-savings");
     assert.equal(inputs[0].options.length, 2);
     assert.equal(inputs[0].options[0].value, "instance-savings");
+  });
+
+  it("should scope extraction to specific templateId", () => {
+    const def = {
+      templates: [
+        {
+          id: "template1",
+          cards: [{
+            inputSection: {
+              components: [{
+                id: "field1",
+                label: "Field 1",
+                type: "number",
+                defaultValue: 10,
+              }],
+            },
+          }],
+        },
+        {
+          id: "template2",
+          cards: [{
+            inputSection: {
+              components: [{
+                id: "field2",
+                label: "Field 2",
+                type: "text",
+                defaultValue: "hello",
+              }],
+            },
+          }],
+        },
+      ],
+    };
+    
+    // No templateId - extracts from all templates
+    const all = extractInputs(def);
+    assert.equal(all.length, 2);
+    
+    // Scoped to template1
+    const t1 = extractInputs(def, "template1");
+    assert.equal(t1.length, 1);
+    assert.equal(t1[0].id, "field1");
+    
+    // Scoped to template2
+    const t2 = extractInputs(def, "template2");
+    assert.equal(t2.length, 1);
+    assert.equal(t2[0].id, "field2");
+    
+    // Non-existent templateId returns empty
+    const t3 = extractInputs(def, "nonexistent");
+    assert.equal(t3.length, 0);
   });
 });
 
