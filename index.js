@@ -42,15 +42,17 @@ function extractInputs(def) {
           description: comp.description || "",
           default: comp.defaultValue ?? comp.value ?? null,
           unit: comp.unit || null,
-          options: comp.options?.map((o) => o.label || o.value) || null,
+          options: comp.options?.map((o) => ({ label: o.label || o.value, value: o.value })) || null,
         };
         
-        // Issue 5 & 6: Add format hints for frequency/fileSize types
+        // Add format hints and unit info for frequency/fileSize types
         if (field.type === "frequency" || field.type === "fileSize") {
           if (comp.unitOptions) {
             field.unitOptions = comp.unitOptions;
+            field.defaultUnit = comp.unitOptions[0]?.value || comp.unit || null;
             field.format = "value with unit selector";
           } else if (field.unit) {
+            field.defaultUnit = field.unit;
             field.format = `value in ${field.unit}`;
           }
         }
@@ -69,26 +71,66 @@ function extractInputs(def) {
   return inputs;
 }
 
-// Issue 2: Build calculationComponents - only include meaningful defaults
+// Resolve a user-provided value: if it matches an option label, return the option value
+function resolveValue(input, rawValue) {
+  if (input.options && typeof rawValue === "string") {
+    const match = input.options.find(
+      (o) => o.label === rawValue || o.value === rawValue
+    );
+    if (match) return match.value;
+  }
+  return rawValue;
+}
+
+// Build calculationComponents with proper format for all field types
 function buildCalcComponents(inputs, userInputs = {}) {
   const cc = {};
+  const inputMap = {};
+  for (const inp of inputs) {
+    if (inp.id) inputMap[inp.id] = inp;
+  }
   
-  // If user provided inputs, use them
+  // If user provided inputs, merge them with defaults (user inputs take priority)
   if (userInputs && Object.keys(userInputs).length > 0) {
+    // First, add all defaults
+    for (const inp of inputs) {
+      if (inp.id && inp.default != null && inp.default !== "") {
+        cc[inp.id] = buildComponentValue(inp, inp.default);
+      }
+    }
+    // Then overlay user-provided values
     for (const [k, v] of Object.entries(userInputs)) {
-      cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
+      if (typeof v === "object" && v !== null && "value" in v) {
+        // Already in { value, unit? } format - resolve label if applicable
+        const inp = inputMap[k];
+        const resolved = inp ? resolveValue(inp, v.value) : v.value;
+        cc[k] = { ...v, value: resolved };
+      } else {
+        const inp = inputMap[k];
+        const resolved = inp ? resolveValue(inp, v) : v;
+        cc[k] = buildComponentValue(inp, resolved);
+      }
     }
     return cc;
   }
   
-  // Otherwise, only include fields with meaningful defaults (not empty/null)
+  // No user inputs: include all fields with meaningful defaults
   for (const inp of inputs) {
     if (inp.id && inp.default != null && inp.default !== "") {
-      cc[inp.id] = { value: inp.default };
+      cc[inp.id] = buildComponentValue(inp, inp.default);
     }
   }
   
   return cc;
+}
+
+// Build a properly formatted component value including unit if needed
+function buildComponentValue(input, value) {
+  if (!input) return { value };
+  if ((input.type === "frequency" || input.type === "fileSize") && input.defaultUnit) {
+    return { value, unit: input.defaultUnit };
+  }
+  return { value };
 }
 
 const server = new McpServer({
@@ -123,7 +165,10 @@ server.tool(
 // Tool 2: Get service schema (input fields)
 server.tool(
   "get_service_schema",
-  "Get the input schema for a specific AWS service. Returns the fields you can set in calculationComponents when creating an estimate. Use the serviceCode from search_services.",
+  `Get the input schema for a specific AWS service. Returns the fields you can set in calculationComponents when creating an estimate.
+Use the serviceCode from search_services. Each field has an 'id' (use as the key in calculationComponents) and for dropdown fields,
+use the 'value' property from the options array (not the 'label') when setting calculationComponents.
+For frequency/fileSize fields, provide { value: number, unit: "unitString" }.`,
   { serviceCode: z.string().describe("Service code (e.g. 'amazonCloudFront', 'eC2Next')") },
   async ({ serviceCode }) => {
     const def = await fetchJSON(API.serviceDef(serviceCode));
@@ -172,9 +217,11 @@ server.tool(
 // Tool 3: Create estimate and get shareable link
 server.tool(
   "create_estimate",
-  `Create an AWS Pricing Calculator estimate and return a shareable link.
+  `Create an AWS Pricing Calculator estimate and return a shareable, editable link.
 Each service needs: serviceCode, region, serviceName, monthlyCost.
 Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.
+Use the 'value' field (not the 'label') from option objects returned by get_service_schema.
+For frequency/fileSize fields, provide { value: number, unit: "unitString" }.
 Optionally provide a 'group' name for each service to organize them into groups.`,
   {
     name: z.string().describe("Estimate name"),
@@ -204,22 +251,17 @@ Optionally provide a 'group' name for each service to organize them into groups.
       const key = `${svc.serviceCode}-${crypto.randomUUID()}`;
       let cc = {};
 
-      // Issue 2: If user provided calculationComponents, use them as-is
-      if (svc.calculationComponents) {
-        for (const [k, v] of Object.entries(svc.calculationComponents)) {
-          cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
-        }
-      }
-
-      // Try to fetch service definition for version and structure
+      // Try to fetch service definition for version, structure, and input schema
       let version = "0.0.1", estimateFor = svc.serviceCode, subServices = undefined;
+      let inputs = [];
       try {
         const def = await fetchJSON(API.serviceDef(svc.serviceCode));
         version = def.version || version;
         estimateFor = def.estimateFor || def.serviceCode;
+        inputs = extractInputs(def);
 
         // If service has subServices in its definition, build them properly
-        if (def.subServices?.length && !svc.calculationComponents) {
+        if (def.subServices?.length) {
           subServices = [];
           for (const sub of def.subServices) {
             try {
@@ -249,13 +291,15 @@ Optionally provide a 'group' name for each service to organize them into groups.
           }
         }
 
-        // If no user-provided cc, build defaults from definition
-        if (!svc.calculationComponents) {
-          const inputs = extractInputs(def);
-          cc = buildCalcComponents(inputs);
-        }
+        // Build calculationComponents: merge defaults with user inputs, resolving labels
+        cc = buildCalcComponents(inputs, svc.calculationComponents || {});
       } catch {
-        // Service definition not found, use minimal structure
+        // Service definition not found, use user-provided components or empty
+        if (svc.calculationComponents) {
+          for (const [k, v] of Object.entries(svc.calculationComponents)) {
+            cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
+          }
+        }
       }
 
       const entry = {
@@ -320,7 +364,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
     
     // Issue 3: Better error handling with response body
     if (!resp.ok) {
-      // Issue 2: Fallback - strip calculationComponents and retry
+      // Fallback - strip calculationComponents and retry
       const strippedServices = [];
       for (const [key, svc] of Object.entries(payload.services)) {
         if (Object.keys(svc.calculationComponents || {}).length > 0) {
@@ -346,10 +390,10 @@ Optionally provide a 'group' name for each service to organize them into groups.
         throw new Error(`Failed to save estimate: ${resp.status} ${resp.statusText}. Response: ${respText}. Retry also failed: ${retryResp.status} ${retryText}`);
       }
       
-      // Issue 7: Provide feedback on what was stripped
-      warnings.push(`⚠️  Original attempt with calculationComponents failed (${resp.status}: ${respText.substring(0, 200)}). Retried without calculationComponents — estimate saved successfully but service configurations won't render in detail.`);
+      warnings.push(`⚠️ calculationComponents were rejected by the API (${resp.status}: ${respText.substring(0, 200)}). The estimate was saved without detailed configurations.`);
+      warnings.push(`To fix: use get_service_schema to verify field IDs and option values, then recreate with corrected calculationComponents.`);
       if (strippedServices.length > 0) {
-        warnings.push(`Services with stripped components: ${strippedServices.join(", ")}`);
+        warnings.push(`Affected services: ${strippedServices.join(", ")}`);
       }
       
       resp = retryResp;
