@@ -365,3 +365,31 @@ describe("buildCalcComponents", () => {
     assert.deepEqual(cc.region, { value: "us-east-1" });
   });
 });
+
+describe("Estimate ID extraction", () => {
+  // Replicate the regex from load_estimate
+  const extractId = (estimateId) => {
+    const match = estimateId.match(/id=([a-zA-Z0-9-]+)/);
+    return match ? match[1] : estimateId;
+  };
+
+  it("should extract ID from standard URL with lowercase hex", () => {
+    assert.equal(extractId("https://calculator.aws/#/estimate?id=abc123def456"), "abc123def456");
+  });
+
+  it("should extract ID from URL with uppercase hex", () => {
+    assert.equal(extractId("https://calculator.aws/#/estimate?id=ABC123DEF456"), "ABC123DEF456");
+  });
+
+  it("should extract ID from URL with mixed case", () => {
+    assert.equal(extractId("https://calculator.aws/#/estimate?id=aBc123DeF456"), "aBc123DeF456");
+  });
+
+  it("should extract ID from URL with hyphens", () => {
+    assert.equal(extractId("https://calculator.aws/#/estimate?id=abc-123-def"), "abc-123-def");
+  });
+
+  it("should use raw string when not a URL", () => {
+    assert.equal(extractId("abc123def456"), "abc123def456");
+  });
+});
