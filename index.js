@@ -24,22 +24,26 @@ const REGION_NAMES = {
   "ap-southeast-2": "Asia Pacific (Sydney)",
   "ap-southeast-3": "Asia Pacific (Jakarta)",
   "ap-southeast-4": "Asia Pacific (Melbourne)",
+  "ap-southeast-5": "Asia Pacific (Malaysia)",
+  "ap-southeast-7": "Asia Pacific (Thailand)",
   "ap-northeast-1": "Asia Pacific (Tokyo)",
   "ap-northeast-2": "Asia Pacific (Seoul)",
   "ap-northeast-3": "Asia Pacific (Osaka)",
   "ca-central-1": "Canada (Central)",
-  "eu-central-1": "Europe (Frankfurt)",
-  "eu-central-2": "Europe (Zurich)",
-  "eu-west-1": "Europe (Ireland)",
-  "eu-west-2": "Europe (London)",
-  "eu-west-3": "Europe (Paris)",
-  "eu-south-1": "Europe (Milan)",
-  "eu-south-2": "Europe (Spain)",
-  "eu-north-1": "Europe (Stockholm)",
+  "ca-west-1": "Canada West (Calgary)",
+  "eu-central-1": "EU (Frankfurt)",
+  "eu-central-2": "EU (Zurich)",
+  "eu-west-1": "EU (Ireland)",
+  "eu-west-2": "EU (London)",
+  "eu-west-3": "EU (Paris)",
+  "eu-south-1": "EU (Milan)",
+  "eu-south-2": "EU (Spain)",
+  "eu-north-1": "EU (Stockholm)",
   "il-central-1": "Israel (Tel Aviv)",
   "me-south-1": "Middle East (Bahrain)",
   "me-central-1": "Middle East (UAE)",
-  "sa-east-1": "South America (São Paulo)",
+  "sa-east-1": "South America (Sao Paulo)",
+  "mx-central-1": "Mexico (Central)",
 };
 
 const FILE_SIZE_TO_GB = { KB: 1 / (1024 * 1024), MB: 1 / 1024, GB: 1, TB: 1024 };
@@ -184,6 +188,14 @@ function normalizeValue(subType, raw) {
 }
 
 async function fetchPricingForService(def, regionName) {
+  // Build mapping from definition name to actual URL from mappingDefinitions
+  const mappingUrls = {};
+  for (const md of def.mappingDefinitions || []) {
+    if (md.mappingDefinitionName && md.mappingDefinitionURL) {
+      mappingUrls[md.mappingDefinitionName] = `https://calculator.aws/${md.mappingDefinitionURL.replace("[currency]", "USD")}`;
+    }
+  }
+
   const mappingDefs = new Set();
   function walkForMappings(comps) {
     for (const c of comps || []) {
@@ -193,7 +205,6 @@ async function fetchPricingForService(def, regionName) {
   }
   for (const tmpl of def.templates || []) {
     for (const card of tmpl.cards || []) {
-      walkForMappings(card.pricingSection?.components);
       walkForMappings(card.inputSection?.components);
     }
   }
@@ -203,7 +214,8 @@ async function fetchPricingForService(def, regionName) {
     const cacheKey = `${name}__${regionName}`;
     if (pricingCache[cacheKey]) { result[name] = pricingCache[cacheKey]; return; }
     try {
-      const data = await fetchJSON(API.pricing(name));
+      const url = mappingUrls[name] || API.pricing(name);
+      const data = await fetchJSON(url);
       const regionData = data.regions?.[regionName] || {};
       const priceMap = {};
       for (const [unit, info] of Object.entries(regionData)) {
@@ -239,7 +251,7 @@ function resolveAllComponents(def, pricingByDef, calculationComponents) {
   }
   for (const tmpl of def.templates || []) {
     for (const card of tmpl.cards || []) {
-      walkPricing(card.pricingSection?.components);
+      walkPricing(card.inputSection?.components);
     }
   }
 
@@ -300,14 +312,38 @@ function resolveAllComponents(def, pricingByDef, calculationComponents) {
   return ctx;
 }
 
-function executeMathsSection(mathsOps, context) {
+// Evaluate displayIf conditions for cards/components
+function evalDisplayIf(condition, context, pricingByDef) {
+  if (!condition) return true;
+  if (condition.exists) {
+    const e = condition.exists;
+    if (e.type === "meteredUnit" && e.mappingDefinitionName) {
+      const priceMap = pricingByDef[e.mappingDefinitionName] || {};
+      return (priceMap[e.meteredUnit] ?? undefined) !== undefined;
+    }
+    return true;
+  }
+  if (condition.and) return condition.and.every(c => evalDisplayIf(c, context, pricingByDef));
+  if (condition.or) return condition.or.some(c => evalDisplayIf(c, context, pricingByDef));
+  if (condition.not) return !evalDisplayIf(condition.not, context, pricingByDef);
+  if (condition["=="]) {
+    const parts = condition["=="];
+    if (Array.isArray(parts) && parts.length === 2) {
+      const left = parts[0]?.type === "component" ? context[parts[0].id] : parts[0];
+      return String(left) === String(parts[1]);
+    }
+  }
+  return true; // default: include
+}
+
+function executeMathsSection(mathsOps, context, pricingByDef) {
   const priceDisplays = [];
 
   function getVal(operand) {
     if (operand == null) return 0;
     if (typeof operand === "number") return operand;
-    if (typeof operand === "string") return Number(context[operand]) || 0;
-    if (operand.type === "constant" || operand.type === "number") return Number(operand.value) || 0;
+    if ("constant" in operand) return Number(operand.constant) || 0;
+    if (operand.variableId) return Number(context[operand.variableId]) || 0;
     if (operand.refer) return Number(context[operand.refer]) || 0;
     if (operand.value != null) return Number(operand.value) || 0;
     return 0;
@@ -315,6 +351,9 @@ function executeMathsSection(mathsOps, context) {
 
   for (const op of mathsOps || []) {
     for (const comp of op.components || []) {
+      // Evaluate displayIf conditions
+      if (comp.displayIf && !evalDisplayIf(comp.displayIf, context, pricingByDef)) continue;
+
       const st = comp.subType || comp.type;
       if (st === "display" || st === "conversionDisplay") continue;
 
@@ -338,12 +377,12 @@ function executeMathsSection(mathsOps, context) {
         context[comp.id] = result;
       } else if (st === "maxMin" && comp.id) {
         const operands = (comp.operands || []).map(getVal);
-        context[comp.id] = comp.operation === "max" ? Math.max(...operands) : Math.min(...operands);
+        context[comp.id] = comp.operation === "Maximum" ? Math.max(...operands) : Math.min(...operands);
       } else if (st === "rounding" && comp.id) {
         const val = getVal(comp.operands?.[0]);
-        const factor = comp.factor || 1;
-        if (comp.operation === "roundUp") context[comp.id] = Math.ceil(val * factor) / factor;
-        else if (comp.operation === "roundDown") context[comp.id] = Math.floor(val * factor) / factor;
+        const factor = Number(comp.factor) || 1;
+        if (comp.method === "roundUp") context[comp.id] = Math.ceil(val / factor) * factor;
+        else if (comp.method === "roundDown") context[comp.id] = Math.floor(val / factor) * factor;
         else context[comp.id] = val;
       } else if (st === "tieredPricingMath" && comp.id) {
         const inputVal = Number(context[comp.inputRefer]) || 0;
@@ -394,10 +433,14 @@ async function calculateServiceCost(serviceCode, region, userInputs) {
       const pricingByDef = await fetchPricingForService(d, regionName);
       const ctx = resolveAllComponents(d, pricingByDef, c);
 
-      for (const tmpl of d.templates || []) {
+      // Only use the first template (templates are alternatives, not cumulative)
+      const tmpl = (d.templates || [])[0];
+      if (tmpl) {
         for (const card of tmpl.cards || []) {
           if (!card.mathsSection) continue;
-          const displays = executeMathsSection(card.mathsSection, ctx);
+          // Evaluate card-level displayIf
+          if (card.displayIf && !evalDisplayIf(card.displayIf, ctx, pricingByDef)) continue;
+          const displays = executeMathsSection(card.mathsSection, ctx, pricingByDef);
           for (const dp of displays) {
             if (dp.costType === "Upfront") upfront += dp.value;
             else monthly += dp.value;
