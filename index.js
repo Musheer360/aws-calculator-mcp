@@ -8,6 +8,7 @@ const API = {
   load: "https://d3knqfixx3sbls.cloudfront.net",
   manifest: "https://d1qsjq9pzbk1k6.cloudfront.net/manifest/en_US.json",
   serviceDef: (code) => `https://d1qsjq9pzbk1k6.cloudfront.net/data/${code}/en_US.json`,
+  pricing: (name) => `https://calculator.aws/pricing/2.0/meteredUnitMaps/${name}/USD/current/${name}.json`,
 };
 
 const REGION_NAMES = {
@@ -41,7 +42,11 @@ const REGION_NAMES = {
   "sa-east-1": "South America (São Paulo)",
 };
 
+const FILE_SIZE_TO_GB = { KB: 1 / (1024 * 1024), MB: 1 / 1024, GB: 1, TB: 1024 };
+const FREQ_TO_MONTH = { "per second": 2592000, "per minute": 43200, "per hour": 720, "per day": 30, "per week": 30 / 7, "per month": 1, "per year": 1 / 12 };
+
 let manifestCache = null;
+const pricingCache = {};
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -164,6 +169,251 @@ function buildComponentValue(input, value) {
   return { value };
 }
 
+// --- Pricing calculation engine ---
+
+function normalizeValue(subType, raw) {
+  if (raw == null) return 0;
+  if (typeof raw === "object" && raw !== null && "value" in raw) {
+    const v = Number(raw.value) || 0;
+    const unit = raw.unit;
+    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null) return v * FILE_SIZE_TO_GB[unit];
+    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null) return v * FREQ_TO_MONTH[unit];
+    return v;
+  }
+  return Number(raw) || 0;
+}
+
+async function fetchPricingForService(def, regionName) {
+  const mappingDefs = new Set();
+  function walkForMappings(comps) {
+    for (const c of comps || []) {
+      if (c.mappingDefinitionName) mappingDefs.add(c.mappingDefinitionName);
+      if (c.components) walkForMappings(c.components);
+    }
+  }
+  for (const tmpl of def.templates || []) {
+    for (const card of tmpl.cards || []) {
+      walkForMappings(card.pricingSection?.components);
+      walkForMappings(card.inputSection?.components);
+    }
+  }
+
+  const result = {};
+  await Promise.all([...mappingDefs].map(async (name) => {
+    const cacheKey = `${name}__${regionName}`;
+    if (pricingCache[cacheKey]) { result[name] = pricingCache[cacheKey]; return; }
+    try {
+      const data = await fetchJSON(API.pricing(name));
+      const regionData = data.regions?.[regionName] || {};
+      const priceMap = {};
+      for (const [unit, info] of Object.entries(regionData)) {
+        priceMap[unit] = parseFloat(info.price) || 0;
+      }
+      pricingCache[cacheKey] = priceMap;
+      result[name] = priceMap;
+    } catch {
+      result[name] = {};
+    }
+  }));
+  return result;
+}
+
+function resolveAllComponents(def, pricingByDef, calculationComponents) {
+  const ctx = {};
+
+  // Seed input values
+  for (const [id, raw] of Object.entries(calculationComponents)) {
+    ctx[id] = raw;
+  }
+
+  // Collect all pricing components across all cards
+  const pricingComps = [];
+  function walkPricing(comps) {
+    for (const c of comps || []) {
+      if (c.type === "pricing" || c.subType === "replace" || c.subType === "singlePricePoint" ||
+          c.subType === "pricingComboV2" || c.subType === "tieredPricing") {
+        pricingComps.push(c);
+      }
+      if (c.components) walkPricing(c.components);
+    }
+  }
+  for (const tmpl of def.templates || []) {
+    for (const card of tmpl.cards || []) {
+      walkPricing(card.pricingSection?.components);
+    }
+  }
+
+  // Normalize all input values based on their subType from inputSection
+  const inputDefs = {};
+  function walkInputDefs(comps) {
+    for (const c of comps || []) {
+      if (c.id) inputDefs[c.id] = c;
+      if (c.components) walkInputDefs(c.components);
+    }
+  }
+  for (const tmpl of def.templates || []) {
+    for (const card of tmpl.cards || []) {
+      walkInputDefs(card.inputSection?.components);
+    }
+  }
+  for (const [id, raw] of Object.entries(calculationComponents)) {
+    const inputDef = inputDefs[id];
+    const subType = inputDef?.subType || inputDef?.type || "";
+    ctx[id] = normalizeValue(subType, raw);
+  }
+
+  // Resolve replace components first
+  for (const c of pricingComps) {
+    if (c.subType === "replace" && c.id) {
+      const inputVal = String(ctx[c.originalId] ?? "");
+      let resolved = "";
+      for (const r of c.replacements || []) {
+        if (String(r.originalString) === inputVal) { resolved = r.replaceString; break; }
+      }
+      ctx[c.id] = resolved;
+    }
+  }
+
+  // Resolve pricing lookups
+  for (const c of pricingComps) {
+    const defName = c.mappingDefinitionName;
+    const priceMap = pricingByDef[defName] || {};
+
+    if (c.subType === "singlePricePoint" && c.id) {
+      const unit = c.meteredUnit?.allRegions || "";
+      ctx[c.id] = priceMap[unit] ?? 0;
+    } else if (c.subType === "pricingComboV2" && c.id) {
+      const refId = c.refers?.[0]?.variableId;
+      const unit = refId ? (ctx[refId] ?? "") : "";
+      ctx[c.id] = typeof unit === "string" ? (priceMap[unit] ?? 0) : 0;
+    } else if (c.subType === "tieredPricing" && c.id) {
+      const tiers = c.tiers?.allRegions || [];
+      const resolvedTiers = tiers.map((t) => ({
+        start: t.startOfTier,
+        end: t.endOfTier,
+        price: priceMap[t.meteredUnit] ?? 0,
+      }));
+      ctx[`__tiers__${c.id}`] = resolvedTiers;
+    }
+  }
+
+  return ctx;
+}
+
+function executeMathsSection(mathsOps, context) {
+  const priceDisplays = [];
+
+  function getVal(operand) {
+    if (operand == null) return 0;
+    if (typeof operand === "number") return operand;
+    if (typeof operand === "string") return Number(context[operand]) || 0;
+    if (operand.type === "constant" || operand.type === "number") return Number(operand.value) || 0;
+    if (operand.refer) return Number(context[operand.refer]) || 0;
+    if (operand.value != null) return Number(operand.value) || 0;
+    return 0;
+  }
+
+  for (const op of mathsOps || []) {
+    for (const comp of op.components || []) {
+      const st = comp.subType || comp.type;
+      if (st === "display" || st === "conversionDisplay") continue;
+
+      if (st === "priceDisplay") {
+        if (comp.subTotalRefer) {
+          priceDisplays.push({ costType: comp.costType || "Monthly", value: Number(context[comp.subTotalRefer]) || 0 });
+        }
+        continue;
+      }
+
+      if (st === "basicMaths" && comp.id) {
+        const operands = (comp.operands || []).map(getVal);
+        let result = operands[0] ?? 0;
+        const operation = comp.operation;
+        for (let i = 1; i < operands.length; i++) {
+          if (operation === "multiplication") result *= operands[i];
+          else if (operation === "addition") result += operands[i];
+          else if (operation === "subtraction") result -= operands[i];
+          else if (operation === "division") result = operands[i] !== 0 ? result / operands[i] : 0;
+        }
+        context[comp.id] = result;
+      } else if (st === "maxMin" && comp.id) {
+        const operands = (comp.operands || []).map(getVal);
+        context[comp.id] = comp.operation === "max" ? Math.max(...operands) : Math.min(...operands);
+      } else if (st === "rounding" && comp.id) {
+        const val = getVal(comp.operands?.[0]);
+        const factor = comp.factor || 1;
+        if (comp.operation === "roundUp") context[comp.id] = Math.ceil(val * factor) / factor;
+        else if (comp.operation === "roundDown") context[comp.id] = Math.floor(val * factor) / factor;
+        else context[comp.id] = val;
+      } else if (st === "tieredPricingMath" && comp.id) {
+        const inputVal = Number(context[comp.inputRefer]) || 0;
+        const tiers = context[`__tiers__${comp.tieredPricingRefer}`] || [];
+        let total = 0;
+        let remaining = inputVal;
+        for (const tier of tiers) {
+          if (remaining <= 0) break;
+          const tierStart = tier.start;
+          const tierEnd = tier.end === -1 ? Infinity : tier.end;
+          const tierSize = tierEnd - tierStart;
+          const qty = Math.min(remaining, tierSize);
+          total += qty * tier.price;
+          remaining -= qty;
+        }
+        context[comp.id] = total;
+      }
+    }
+  }
+
+  return priceDisplays;
+}
+
+async function calculateServiceCost(serviceCode, region, userInputs) {
+  try {
+    const def = await fetchJSON(API.serviceDef(serviceCode));
+    const inputs = extractInputs(def);
+    const cc = buildCalcComponents(inputs, userInputs);
+    const regionName = REGION_NAMES[region] || "US East (N. Virginia)";
+
+    // Handle services with subServices
+    const defs = [];
+    if (def.subServices?.length) {
+      for (const sub of def.subServices) {
+        try {
+          const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
+          const subInputs = extractInputs(subDef);
+          const subCC = buildCalcComponents(subInputs, userInputs);
+          defs.push({ def: subDef, cc: subCC });
+        } catch { /* skip failed subService */ }
+      }
+    }
+    defs.push({ def, cc });
+
+    let monthly = 0, upfront = 0;
+
+    for (const { def: d, cc: c } of defs) {
+      const pricingByDef = await fetchPricingForService(d, regionName);
+      const ctx = resolveAllComponents(d, pricingByDef, c);
+
+      for (const tmpl of d.templates || []) {
+        for (const card of tmpl.cards || []) {
+          if (!card.mathsSection) continue;
+          const displays = executeMathsSection(card.mathsSection, ctx);
+          for (const dp of displays) {
+            if (dp.costType === "Upfront") upfront += dp.value;
+            else monthly += dp.value;
+          }
+        }
+      }
+    }
+
+    return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: cc };
+  } catch {
+    return null;
+  }
+}
+
+// --- End pricing calculation engine ---
+
 const server = new McpServer({
   name: "aws-calculator",
   version: "1.0.0",
@@ -245,11 +495,68 @@ For frequency/fileSize fields, provide { value: number, unit: "unitString" }.`,
   }
 );
 
+// Tool 2.5: Configure a service and calculate cost
+server.tool(
+  "configure_service",
+  `Configure an AWS service with specific parameters and get the calculated monthly cost.
+This tool fetches real-time AWS pricing data and calculates the exact cost based on your configuration.
+Use serviceCode from search_services. Pass input field values from get_service_schema as the 'inputs' parameter.
+Returns the calculated monthly/upfront costs and the formatted calculationComponents ready for create_estimate.`,
+  {
+    serviceCode: z.string().describe("Service code from search_services"),
+    region: z.string().default("us-east-1").describe("AWS region code"),
+    inputs: z.record(z.any()).default({}).describe("Input field values keyed by field ID from get_service_schema"),
+  },
+  async ({ serviceCode, region, inputs }) => {
+    const def = await fetchJSON(API.serviceDef(serviceCode));
+    const allInputs = extractInputs(def);
+    const cc = buildCalcComponents(allInputs, inputs);
+    const result = await calculateServiceCost(serviceCode, region, inputs);
+
+    const lines = [`🔧 ${def.serviceName} (${REGION_NAMES[region] || region})`];
+    if (result) {
+      lines.push(`💰 Monthly: $${result.monthly.toFixed(2)} | Upfront: $${result.upfront.toFixed(2)}`);
+    } else {
+      lines.push(`⚠️ Could not calculate cost automatically. Cost set to $0.00.`);
+    }
+
+    // Summarize configured values
+    const configured = Object.entries(inputs);
+    if (configured.length > 0) {
+      lines.push("", "Configured:");
+      for (const [k, v] of configured) {
+        const inp = allInputs.find((i) => i.id === k);
+        const label = inp?.label || k;
+        const display = typeof v === "object" && v !== null && "value" in v ? `${v.value} ${v.unit || ""}`.trim() : String(v);
+        lines.push(`  • ${label}: ${display}`);
+      }
+    }
+
+    lines.push("", "calculationComponents (use in create_estimate):");
+    lines.push(JSON.stringify(result?.calculationComponents || cc, null, 2));
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          serviceName: def.serviceName,
+          serviceCode: def.serviceCode,
+          region,
+          monthlyCost: result?.monthly ?? 0,
+          upfrontCost: result?.upfront ?? 0,
+          calculationComponents: result?.calculationComponents || cc,
+          summary: lines.slice(0, 3).join("\n"),
+        }, null, 2),
+      }],
+    };
+  }
+);
+
 // Tool 3: Create estimate and get shareable link
 server.tool(
   "create_estimate",
   `Create an AWS Pricing Calculator estimate and return a shareable, editable link.
-Each service needs: serviceCode, region, serviceName, monthlyCost.
+Each service needs: serviceCode, region, serviceName. monthlyCost is auto-calculated if 0 or not provided.
 Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.
 Use the 'value' field (not the 'label') from option objects returned by get_service_schema.
 For frequency/fileSize fields, provide { value: number, unit: "unitString" }.
@@ -264,7 +571,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
           regionName: z.string().optional().describe("Human-readable region name"),
           serviceName: z.string().describe("Display name (e.g. 'Amazon EC2')"),
           description: z.string().optional().describe("Service description/notes"),
-          monthlyCost: z.number().describe("Monthly cost in USD"),
+          monthlyCost: z.number().default(0).describe("Monthly cost in USD (auto-calculated if 0)"),
           upfrontCost: z.number().default(0).describe("Upfront cost in USD"),
           configSummary: z.string().optional().describe("Brief config summary shown in the estimate table"),
           calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
@@ -333,6 +640,17 @@ Optionally provide a 'group' name for each service to organize them into groups.
         }
       }
 
+      // Auto-calculate cost if monthlyCost is 0
+      let monthlyCost = svc.monthlyCost || 0;
+      let upfrontCost = svc.upfrontCost || 0;
+      if (monthlyCost === 0) {
+        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {});
+        if (calcResult) {
+          monthlyCost = calcResult.monthly;
+          upfrontCost = upfrontCost || calcResult.upfront;
+        }
+      }
+
       const entry = {
         version,
         serviceCode: svc.serviceCode,
@@ -340,7 +658,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
         region: svc.region,
         description: svc.description || null,
         calculationComponents: cc,
-        serviceCost: { monthly: svc.monthlyCost, upfront: svc.upfrontCost || 0 },
+        serviceCost: { monthly: monthlyCost, upfront: upfrontCost },
         serviceName: svc.serviceName,
         regionName: svc.regionName || REGION_NAMES[svc.region] || svc.region,
         configSummary: svc.configSummary || "",
@@ -348,8 +666,8 @@ Optionally provide a 'group' name for each service to organize them into groups.
       if (subServices) entry.subServices = subServices;
 
       svcMap[key] = entry;
-      totalMonthly += svc.monthlyCost;
-      totalUpfront += svc.upfrontCost || 0;
+      totalMonthly += monthlyCost;
+      totalUpfront += upfrontCost;
       
       // Issue 1: Track group membership
       if (svc.group) {
@@ -458,9 +776,11 @@ Optionally provide a 'group' name for each service to organize them into groups.
     }
     
     output.push(`Services: ${services.length}`);
-    for (const s of services) {
-      const groupLabel = s.group ? ` [${s.group}]` : "";
-      output.push(`  • ${s.serviceName} (${s.region}): $${s.monthlyCost.toFixed(2)}/mo${groupLabel}`);
+    for (const [key, entry] of Object.entries(svcMap)) {
+      const groupLabel = entry.serviceName ? "" : "";
+      const svc = services.find(s => entry.serviceCode === s.serviceCode);
+      const grp = svc?.group ? ` [${svc.group}]` : "";
+      output.push(`  • ${entry.serviceName} (${entry.region}): $${entry.serviceCost.monthly.toFixed(2)}/mo${grp}`);
     }
     
     if (warnings.length > 0) {
