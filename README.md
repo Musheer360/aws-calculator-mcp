@@ -114,16 +114,18 @@ The server calls calculator.aws's internal REST APIs (no authentication required
 For each service in your estimate, the server:
 1. Fetches the service definition to get the correct version, schema, and default values
 2. For services with subServices (like S3), fetches each subService's definition too
-3. Builds properly structured `calculationComponents` from defaults or user-provided values
-4. Assembles the full estimate JSON and POSTs it to the save API
-5. Returns the shareable `calculator.aws` link
+3. Builds properly structured `calculationComponents` from defaults merged with user-provided values
+4. Resolves option labels to API values automatically (e.g., "S3 Standard" → `s3Standard`)
+5. Includes proper unit information for frequency/fileSize fields
+6. Assembles the full estimate JSON and POSTs it to the save API
+7. Returns the shareable `calculator.aws` link
 
 ## Limitations
 
 - **Internal APIs**: These are undocumented calculator.aws endpoints. They could change without notice.
 - **No cost calculation**: The server stores whatever costs you provide. It doesn't compute prices from configuration — the AI agent needs to know the prices.
 - **Estimate expiry**: Calculator.aws estimates expire after 1 year.
-- **Service drill-down**: Estimate totals always display correctly. Individual service configuration views may show "Required inputs" for services with complex schemas unless you provide explicit `calculationComponents`.
+- **Service drill-down**: Estimate totals always display correctly. Individual service configuration views may show "Required inputs" for services with complex schemas unless you provide explicit `calculationComponents`. Use `get_service_schema` to see available fields and their option values.
 
 ## License
 
