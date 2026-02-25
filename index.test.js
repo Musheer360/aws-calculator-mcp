@@ -103,6 +103,104 @@ function buildCalcComponents(inputs, userInputs = {}) {
 
 // ---- Tests ----
 
+// -- Pricing engine helper functions (replicated from index.js) --
+
+const FILE_SIZE_TO_GB = { KB: 1 / (1024 * 1024), MB: 1 / 1024, GB: 1, TB: 1024 };
+const FREQ_TO_MONTH = { "per second": 2592000, "per minute": 43200, "per hour": 720, "per day": 30, "per week": 30 / 7, "per month": 1, "per year": 1 / 12 };
+
+function normalizeValue(subType, raw) {
+  if (raw == null) return 0;
+  if (typeof raw === "object" && raw !== null && "value" in raw) {
+    const v = Number(raw.value) || 0;
+    const unit = raw.unit;
+    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null) return v * FILE_SIZE_TO_GB[unit];
+    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null) return v * FREQ_TO_MONTH[unit];
+    return v;
+  }
+  return Number(raw) || 0;
+}
+
+function evalDisplayIf(condition, context, pricingByDef) {
+  if (!condition) return true;
+  if (condition.exists) {
+    const e = condition.exists;
+    if (e.type === "meteredUnit" && e.mappingDefinitionName) {
+      return (pricingByDef[e.mappingDefinitionName] || {})[e.meteredUnit] !== undefined;
+    }
+    return true;
+  }
+  if (condition.and) return condition.and.every(c => evalDisplayIf(c, context, pricingByDef));
+  if (condition.or) return condition.or.some(c => evalDisplayIf(c, context, pricingByDef));
+  if (condition.not) return !evalDisplayIf(condition.not, context, pricingByDef);
+  if (condition["=="]) {
+    const parts = condition["=="];
+    if (Array.isArray(parts) && parts.length === 2) {
+      const left = parts[0]?.type === "component" ? context[parts[0].id] : parts[0];
+      return String(left) === String(parts[1]);
+    }
+  }
+  return true;
+}
+
+function executeMathsSection(mathsOps, context, pricingByDef) {
+  const priceDisplays = [];
+  function getVal(operand) {
+    if (operand == null) return 0;
+    if (typeof operand === "number") return operand;
+    if ("constant" in operand) return Number(operand.constant) || 0;
+    if (operand.variableId) return Number(context[operand.variableId]) || 0;
+    if (operand.refer) return Number(context[operand.refer]) || 0;
+    if (operand.value != null) return Number(operand.value) || 0;
+    return 0;
+  }
+  for (const op of mathsOps || []) {
+    for (const comp of op.components || []) {
+      if (comp.displayIf && !evalDisplayIf(comp.displayIf, context, pricingByDef)) continue;
+      const st = comp.subType || comp.type;
+      if (st === "display" || st === "conversionDisplay") continue;
+      if (st === "priceDisplay") {
+        if (comp.subTotalRefer) priceDisplays.push({ costType: comp.costType || "Monthly", value: Number(context[comp.subTotalRefer]) || 0 });
+        continue;
+      }
+      if (st === "basicMaths" && comp.id) {
+        const operands = (comp.operands || []).map(getVal);
+        let result = operands[0] ?? 0;
+        for (let i = 1; i < operands.length; i++) {
+          if (comp.operation === "multiplication") result *= operands[i];
+          else if (comp.operation === "addition") result += operands[i];
+          else if (comp.operation === "subtraction") result -= operands[i];
+          else if (comp.operation === "division") result = operands[i] !== 0 ? result / operands[i] : 0;
+        }
+        context[comp.id] = result;
+      } else if (st === "maxMin" && comp.id) {
+        const operands = (comp.operands || []).map(getVal);
+        context[comp.id] = comp.operation === "Maximum" ? Math.max(...operands) : Math.min(...operands);
+      } else if (st === "rounding" && comp.id) {
+        const val = getVal(comp.operands?.[0]);
+        const factor = Number(comp.factor) || 1;
+        if (comp.method === "roundUp") context[comp.id] = Math.ceil(val / factor) * factor;
+        else if (comp.method === "roundDown") context[comp.id] = Math.floor(val / factor) * factor;
+        else context[comp.id] = val;
+      } else if (st === "tieredPricingMath" && comp.id) {
+        const inputVal = Number(context[comp.inputRefer]) || 0;
+        const tiers = context[`__tiers__${comp.tieredPricingRefer}`] || [];
+        let total = 0, remaining = inputVal;
+        for (const tier of tiers) {
+          if (remaining <= 0) break;
+          const tierEnd = tier.end === -1 ? Infinity : tier.end;
+          const qty = Math.min(remaining, tierEnd - tier.start);
+          total += qty * tier.price;
+          remaining -= qty;
+        }
+        context[comp.id] = total;
+      }
+    }
+  }
+  return priceDisplays;
+}
+
+// -- End pricing engine functions --
+
 describe("extractInputs", () => {
   it("should return options as objects with label and value", () => {
     const def = {
@@ -391,5 +489,236 @@ describe("Estimate ID extraction", () => {
 
   it("should use raw string when not a URL", () => {
     assert.equal(extractId("abc123def456"), "abc123def456");
+  });
+});
+
+describe("normalizeValue", () => {
+  it("should convert fileSize MB to GB", () => {
+    assert.equal(normalizeValue("fileSize", { value: 512, unit: "MB" }), 0.5);
+    assert.equal(normalizeValue("fileSize", { value: 1024, unit: "MB" }), 1);
+  });
+
+  it("should convert fileSize TB to GB", () => {
+    assert.equal(normalizeValue("fileSize", { value: 1, unit: "TB" }), 1024);
+  });
+
+  it("should keep fileSize GB as-is", () => {
+    assert.equal(normalizeValue("fileSize", { value: 100, unit: "GB" }), 100);
+  });
+
+  it("should convert frequency per second to per month", () => {
+    assert.equal(normalizeValue("frequency", { value: 1, unit: "per second" }), 2592000);
+  });
+
+  it("should keep frequency per month as-is", () => {
+    assert.equal(normalizeValue("frequency", { value: 1000000, unit: "per month" }), 1000000);
+  });
+
+  it("should return raw number for other types", () => {
+    assert.equal(normalizeValue("numericInput", 42), 42);
+    assert.equal(normalizeValue("dropdown", { value: "1" }), 1);
+  });
+
+  it("should return 0 for null", () => {
+    assert.equal(normalizeValue("fileSize", null), 0);
+    assert.equal(normalizeValue("frequency", undefined), 0);
+  });
+});
+
+describe("evalDisplayIf", () => {
+  const pricingByDef = {
+    lambda: { "Lambda Requests": 0.0000002, "Lambda Duration": 0.0000166667, "Lambda Duration Tier2": 0.0000150000 },
+  };
+
+  it("should return true for null condition", () => {
+    assert.equal(evalDisplayIf(null, {}, {}), true);
+  });
+
+  it("should check metered unit existence", () => {
+    assert.equal(evalDisplayIf(
+      { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "Lambda Requests" } },
+      {}, pricingByDef
+    ), true);
+    assert.equal(evalDisplayIf(
+      { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "NonExistent" } },
+      {}, pricingByDef
+    ), false);
+  });
+
+  it("should handle AND conditions", () => {
+    assert.equal(evalDisplayIf({
+      and: [
+        { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "Lambda Requests" } },
+        { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "Lambda Duration" } },
+      ]
+    }, {}, pricingByDef), true);
+    assert.equal(evalDisplayIf({
+      and: [
+        { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "Lambda Requests" } },
+        { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "NonExistent" } },
+      ]
+    }, {}, pricingByDef), false);
+  });
+
+  it("should handle NOT conditions", () => {
+    assert.equal(evalDisplayIf({
+      not: { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "Lambda Requests" } }
+    }, {}, pricingByDef), false);
+    assert.equal(evalDisplayIf({
+      not: { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "NonExistent" } }
+    }, {}, pricingByDef), true);
+  });
+
+  it("should handle == conditions", () => {
+    const ctx = { storageClass: "s3Standard" };
+    assert.equal(evalDisplayIf({
+      "==": [{ type: "component", id: "storageClass" }, "s3Standard"]
+    }, ctx, {}), true);
+    assert.equal(evalDisplayIf({
+      "==": [{ type: "component", id: "storageClass" }, "s3Glacier"]
+    }, ctx, {}), false);
+  });
+});
+
+describe("executeMathsSection", () => {
+  it("should perform basic multiplication", () => {
+    const ctx = { a: 10, b: 5 };
+    const ops = [{ components: [{
+      type: "maths", subType: "basicMaths", id: "result", operation: "multiplication",
+      operands: [{ variableId: "a" }, { variableId: "b" }]
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    assert.equal(ctx.result, 50);
+  });
+
+  it("should perform addition with constants", () => {
+    const ctx = { a: 100 };
+    const ops = [{ components: [{
+      type: "maths", subType: "basicMaths", id: "result", operation: "addition",
+      operands: [{ variableId: "a" }, { constant: 50 }]
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    assert.equal(ctx.result, 150);
+  });
+
+  it("should perform subtraction", () => {
+    const ctx = { total: 1000000 };
+    const ops = [{ components: [{
+      type: "maths", subType: "basicMaths", id: "result", operation: "subtraction",
+      operands: [{ variableId: "total" }, { constant: 400000 }]
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    assert.equal(ctx.result, 600000);
+  });
+
+  it("should handle max operation", () => {
+    const ctx = { a: -100 };
+    const ops = [{ components: [{
+      type: "maths", subType: "maxMin", id: "result", operation: "Maximum",
+      operands: [{ variableId: "a" }, { constant: 0 }]
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    assert.equal(ctx.result, 0);
+  });
+
+  it("should handle rounding up", () => {
+    const ctx = { a: 5.3 };
+    const ops = [{ components: [{
+      type: "maths", subType: "rounding", id: "result", method: "roundUp", factor: "1",
+      operands: [{ variableId: "a" }]
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    assert.equal(ctx.result, 6);
+  });
+
+  it("should calculate tiered pricing", () => {
+    const ctx = {
+      storageGB: 60000,
+      "__tiers__storageTier": [
+        { start: 0, end: 51200, price: 0.023 },
+        { start: 51201, end: 512000, price: 0.022 },
+        { start: 512001, end: -1, price: 0.021 },
+      ]
+    };
+    const ops = [{ components: [{
+      type: "maths", subType: "tieredPricingMath", id: "result",
+      inputRefer: "storageGB", tieredPricingRefer: "storageTier"
+    }] }];
+    executeMathsSection(ops, ctx, {});
+    // First 51200 × $0.023 = $1177.60, Next 8800 × $0.022 = $193.60
+    const expected = 51200 * 0.023 + 8800 * 0.022;
+    assert.ok(Math.abs(ctx.result - expected) < 0.01, `Expected ~${expected.toFixed(2)}, got ${ctx.result.toFixed(2)}`);
+  });
+
+  it("should collect priceDisplay results", () => {
+    const ctx = { totalCost: 42.50 };
+    const ops = [{ components: [{
+      type: "display", subType: "priceDisplay", costType: "Monthly",
+      subTotalRefer: "totalCost", id: "display1"
+    }] }];
+    const displays = executeMathsSection(ops, ctx, {});
+    assert.equal(displays.length, 1);
+    assert.equal(displays[0].costType, "Monthly");
+    assert.equal(displays[0].value, 42.50);
+  });
+
+  it("should skip components with failing displayIf", () => {
+    const ctx = { a: 10 };
+    const pricingByDef = { lambda: {} }; // No metered units
+    const ops = [{ components: [{
+      displayIf: { exists: { type: "meteredUnit", mappingDefinitionName: "lambda", meteredUnit: "NonExistent" } },
+      type: "maths", subType: "basicMaths", id: "result", operation: "multiplication",
+      operands: [{ variableId: "a" }, { constant: 5 }]
+    }] }];
+    executeMathsSection(ops, ctx, pricingByDef);
+    assert.equal(ctx.result, undefined); // Should not have been calculated
+  });
+
+  it("should compute a complete Lambda-like calculation", () => {
+    // Simulate Lambda pricing: requests × duration(ms) × 0.001 × memory(GB) = GB-seconds
+    // Then subtract free tier and multiply by price
+    const ctx = {
+      numberOfRequests: 10000000,
+      durationOfEachRequest: 200,
+      sizeOfMemoryAllocated: 0.5,  // 512MB in GB
+      requestPrice: 0.0000002,
+      durationPrice: 0.0000166667,
+    };
+    const ops = [{ components: [
+      // Step 1: compute seconds = requests × duration(ms) × 0.001
+      { type: "maths", subType: "basicMaths", id: "totalSeconds", operation: "multiplication",
+        operands: [{ variableId: "numberOfRequests" }, { variableId: "durationOfEachRequest" }, { constant: 0.001 }] },
+      // Step 2: GB-seconds = memory × totalSeconds
+      { type: "maths", subType: "basicMaths", id: "gbSeconds", operation: "multiplication",
+        operands: [{ variableId: "sizeOfMemoryAllocated" }, { variableId: "totalSeconds" }] },
+      // Step 3: subtract free tier
+      { type: "maths", subType: "basicMaths", id: "billableGBs", operation: "subtraction",
+        operands: [{ variableId: "gbSeconds" }, { constant: 400000 }] },
+      // Step 4: max(0, billable)
+      { type: "maths", subType: "maxMin", id: "cappedGBs", operation: "Maximum",
+        operands: [{ variableId: "billableGBs" }, { constant: 0 }] },
+      // Step 5: duration cost = cappedGBs × price
+      { type: "maths", subType: "basicMaths", id: "durationCost", operation: "multiplication",
+        operands: [{ variableId: "cappedGBs" }, { variableId: "durationPrice" }] },
+      // Step 6: billable requests
+      { type: "maths", subType: "basicMaths", id: "billableRequests", operation: "subtraction",
+        operands: [{ variableId: "numberOfRequests" }, { constant: 1000000 }] },
+      { type: "maths", subType: "maxMin", id: "cappedRequests", operation: "Maximum",
+        operands: [{ variableId: "billableRequests" }, { constant: 0 }] },
+      // Step 7: request cost
+      { type: "maths", subType: "basicMaths", id: "requestCost", operation: "multiplication",
+        operands: [{ variableId: "cappedRequests" }, { variableId: "requestPrice" }] },
+      // Step 8: total
+      { type: "maths", subType: "basicMaths", id: "totalCost", operation: "addition",
+        operands: [{ variableId: "durationCost" }, { variableId: "requestCost" }] },
+      // Display
+      { type: "display", subType: "priceDisplay", costType: "Monthly", subTotalRefer: "totalCost", id: "display" },
+    ] }];
+    
+    const displays = executeMathsSection(ops, ctx, {});
+    // GB-seconds: 10M × 200 × 0.001 × 0.5 = 1,000,000. Billable: 600,000. Cost: $10.00
+    // Requests: 9M × $0.0000002 = $1.80. Total: $11.80
+    assert.equal(displays.length, 1);
+    assert.ok(Math.abs(displays[0].value - 11.80) < 0.01, `Expected ~$11.80, got $${displays[0].value.toFixed(2)}`);
   });
 });
