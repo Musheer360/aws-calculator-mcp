@@ -1,8 +1,8 @@
 import { describe, it } from "node:test";
+import { calculateServiceCostFromDefinition } from "./index.js";
 import assert from "node:assert/strict";
 
-// We can't directly import the functions from index.js since they're not exported
-// and the file connects to MCP on import. So we extract and test the pure logic here.
+// Most pure helpers are mirrored locally for focused unit tests; exported helpers are imported directly where useful.
 
 // ---- Replicate the pure functions from index.js for testing ----
 
@@ -142,13 +142,21 @@ const FREQ_TO_MONTH = { "per second": 2592000, "per minute": 43200, "per hour": 
 function normalizeValue(subType, raw) {
   if (raw == null) return 0;
   if (typeof raw === "object" && raw !== null && "value" in raw) {
-    const v = Number(raw.value) || 0;
+    const rawValue = raw.value;
+    const parsed = Number(rawValue);
+    const hasNumericValue = Number.isFinite(parsed);
+    const v = hasNumericValue ? parsed : rawValue;
     const unit = raw.unit;
-    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null) return v * FILE_SIZE_TO_GB[unit];
-    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null) return v * FREQ_TO_MONTH[unit];
+    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null && hasNumericValue) return parsed * FILE_SIZE_TO_GB[unit];
+    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null && hasNumericValue) return parsed * FREQ_TO_MONTH[unit];
     return v;
   }
-  return Number(raw) || 0;
+  if (typeof raw === "number") return raw;
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : raw;
+  }
+  return 0;
 }
 
 function evalDisplayIf(condition, context, pricingByDef) {
@@ -695,6 +703,7 @@ describe("normalizeValue", () => {
   it("should return raw number for other types", () => {
     assert.equal(normalizeValue("numericInput", 42), 42);
     assert.equal(normalizeValue("dropdown", { value: "1" }), 1);
+    assert.equal(normalizeValue("dropdown", { value: "s3Standard" }), "s3Standard");
   });
 
   it("should return 0 for null", () => {
@@ -898,5 +907,38 @@ describe("executeMathsSection", () => {
     // Requests: 9M × $0.0000002 = $1.80. Total: $11.80
     assert.equal(displays.length, 1);
     assert.ok(Math.abs(displays[0].value - 11.80) < 0.01, `Expected ~$11.80, got $${displays[0].value.toFixed(2)}`);
+  });
+});
+
+
+describe("calculateServiceCostFromDefinition", () => {
+  it("should compute cost using provided definition and pricing maps", async () => {
+    const def = {
+      serviceCode: "demo",
+      templates: [{
+        id: "template_0",
+        cards: [{
+          inputSection: {
+            components: [
+              { id: "qty", type: "numericInput", defaultValue: 2 },
+              { id: "unitPrice", type: "pricing", subType: "singlePricePoint", mappingDefinitionName: "demoPricing", meteredUnit: { allRegions: "Unit" } },
+            ],
+          },
+          mathsSection: [{
+            components: [
+              { id: "subtotal", subType: "basicMaths", operation: "multiplication", operands: [{ variableId: "qty" }, { variableId: "unitPrice" }] },
+              { subType: "priceDisplay", subTotalRefer: "subtotal", costType: "Monthly" },
+            ],
+          }],
+        }],
+      }],
+    };
+
+    const pricingByDef = { demoPricing: { Unit: 3 } };
+    const result = await calculateServiceCostFromDefinition(def, "us-east-1", {}, "template_0", pricingByDef);
+    assert.ok(result);
+    assert.equal(result.monthly, 6);
+    assert.equal(result.upfront, 0);
+    assert.deepEqual(result.calculationComponents, { qty: { value: 2 } });
   });
 });
