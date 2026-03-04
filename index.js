@@ -210,16 +210,24 @@ function buildComponentValue(input, value) {
 function normalizeValue(subType, raw) {
   if (raw == null) return 0;
   if (typeof raw === "object" && raw !== null && "value" in raw) {
-    const v = Number(raw.value) || 0;
+    const rawValue = raw.value;
+    const parsed = Number(rawValue);
+    const hasNumericValue = Number.isFinite(parsed);
+    const v = hasNumericValue ? parsed : rawValue;
     const unit = raw.unit;
-    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null) return v * FILE_SIZE_TO_GB[unit];
-    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null) return v * FREQ_TO_MONTH[unit];
+    if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null && hasNumericValue) return parsed * FILE_SIZE_TO_GB[unit];
+    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null && hasNumericValue) return parsed * FREQ_TO_MONTH[unit];
     return v;
   }
-  return Number(raw) || 0;
+  if (typeof raw === "number") return raw;
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : raw;
+  }
+  return 0;
 }
 
-async function fetchPricingForService(def, regionName) {
+async function fetchPricingForService(def, regionName, templateId = null) {
   // Build mapping from definition name to actual URL from mappingDefinitions
   const mappingUrls = {};
   for (const md of def.mappingDefinitions || []) {
@@ -235,7 +243,10 @@ async function fetchPricingForService(def, regionName) {
       if (c.components) walkForMappings(c.components);
     }
   }
-  for (const tmpl of def.templates || []) {
+  const templates = templateId
+    ? (def.templates || []).filter((t) => t.id === templateId)
+    : (def.templates || []);
+  for (const tmpl of templates) {
     for (const card of tmpl.cards || []) {
       walkForMappings(card.inputSection?.components);
     }
@@ -262,7 +273,7 @@ async function fetchPricingForService(def, regionName) {
   return result;
 }
 
-function resolveAllComponents(def, pricingByDef, calculationComponents) {
+function resolveAllComponents(def, pricingByDef, calculationComponents, templateId = null) {
   const ctx = {};
 
   // Seed input values
@@ -281,7 +292,10 @@ function resolveAllComponents(def, pricingByDef, calculationComponents) {
       if (c.components) walkPricing(c.components);
     }
   }
-  for (const tmpl of def.templates || []) {
+  const templates = templateId
+    ? (def.templates || []).filter((t) => t.id === templateId)
+    : (def.templates || []);
+  for (const tmpl of templates) {
     for (const card of tmpl.cards || []) {
       walkPricing(card.inputSection?.components);
     }
@@ -295,7 +309,7 @@ function resolveAllComponents(def, pricingByDef, calculationComponents) {
       if (c.components) walkInputDefs(c.components);
     }
   }
-  for (const tmpl of def.templates || []) {
+  for (const tmpl of templates) {
     for (const card of tmpl.cards || []) {
       walkInputDefs(card.inputSection?.components);
     }
@@ -438,11 +452,47 @@ function executeMathsSection(mathsOps, context, pricingByDef) {
   return priceDisplays;
 }
 
-async function calculateServiceCost(serviceCode, region, userInputs) {
+
+function computeCostFromPreparedDefinition(def, regionName, userInputs = {}, templateId = null, pricingByDefOverride = null) {
+  const inputs = extractInputs(def, templateId);
+  const cc = buildCalcComponents(inputs, userInputs);
+  const pricingByDef = pricingByDefOverride || {};
+  const ctx = resolveAllComponents(def, pricingByDef, cc, templateId);
+
+  let monthly = 0;
+  let upfront = 0;
+  const tmpl = templateId
+    ? (def.templates || []).find((t) => t.id === templateId)
+    : (def.templates || [])[0];
+
+  if (tmpl) {
+    for (const card of tmpl.cards || []) {
+      if (!card.mathsSection) continue;
+      if (card.displayIf && !evalDisplayIf(card.displayIf, ctx, pricingByDef)) continue;
+      const displays = executeMathsSection(card.mathsSection, ctx, pricingByDef);
+      for (const dp of displays) {
+        if (dp.costType === "Upfront") upfront += dp.value;
+        else monthly += dp.value;
+      }
+    }
+  }
+
+  return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: cc };
+}
+
+async function calculateServiceCostFromDefinition(def, region, userInputs = {}, templateId = null, pricingByDefOverride = null) {
+  try {
+    const regionName = REGION_NAMES[region] || region || "US East (N. Virginia)";
+    const pricingByDef = pricingByDefOverride || await fetchPricingForService(def, regionName, templateId);
+    return computeCostFromPreparedDefinition(def, regionName, userInputs, templateId, pricingByDef);
+  } catch {
+    return null;
+  }
+}
+
+async function calculateServiceCost(serviceCode, region, userInputs, templateId = null) {
   try {
     const def = await fetchJSON(API.serviceDef(serviceCode));
-    const inputs = extractInputs(def);
-    const cc = buildCalcComponents(inputs, userInputs);
     const regionName = REGION_NAMES[region] || "US East (N. Virginia)";
 
     // Handle services with subServices
@@ -451,37 +501,26 @@ async function calculateServiceCost(serviceCode, region, userInputs) {
       for (const sub of def.subServices) {
         try {
           const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
-          const subInputs = extractInputs(subDef);
-          const subCC = buildCalcComponents(subInputs, userInputs);
-          defs.push({ def: subDef, cc: subCC });
+          defs.push(subDef);
         } catch { /* skip failed subService */ }
       }
     }
-    defs.push({ def, cc });
+    defs.push(def);
 
     let monthly = 0, upfront = 0;
+    let rootCalculationComponents = {};
 
-    for (const { def: d, cc: c } of defs) {
-      const pricingByDef = await fetchPricingForService(d, regionName);
-      const ctx = resolveAllComponents(d, pricingByDef, c);
-
-      // Only use the first template (templates are alternatives, not cumulative)
-      const tmpl = (d.templates || [])[0];
-      if (tmpl) {
-        for (const card of tmpl.cards || []) {
-          if (!card.mathsSection) continue;
-          // Evaluate card-level displayIf
-          if (card.displayIf && !evalDisplayIf(card.displayIf, ctx, pricingByDef)) continue;
-          const displays = executeMathsSection(card.mathsSection, ctx, pricingByDef);
-          for (const dp of displays) {
-            if (dp.costType === "Upfront") upfront += dp.value;
-            else monthly += dp.value;
-          }
-        }
+    for (const d of defs) {
+      const pricingByDef = await fetchPricingForService(d, regionName, templateId);
+      const result = computeCostFromPreparedDefinition(d, regionName, userInputs, templateId, pricingByDef);
+      if (d.serviceCode === def.serviceCode) {
+        rootCalculationComponents = result.calculationComponents;
       }
+      monthly += result.monthly;
+      upfront += result.upfront;
     }
 
-    return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: cc };
+    return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: rootCalculationComponents };
   } catch {
     return null;
   }
@@ -581,14 +620,15 @@ Returns the calculated monthly/upfront costs and the formatted calculationCompon
   {
     serviceCode: z.string().describe("Service code from search_services"),
     region: z.string().default("us-east-1").describe("AWS region code"),
+    templateId: z.string().optional().describe("Optional template ID for services with multiple calculator templates"),
     inputs: z.record(z.any()).default({}).describe("Input field values keyed by field ID from get_service_schema"),
   },
-  async ({ serviceCode, region, inputs }) => {
+  async ({ serviceCode, region, templateId, inputs }) => {
     const def = await fetchJSON(API.serviceDef(serviceCode));
-    const allInputs = extractInputs(def);
+    const activeTemplateId = templateId || def.templates?.[0]?.id || null;
+    const allInputs = extractInputs(def, activeTemplateId);
     const cc = buildCalcComponents(allInputs, inputs);
-    const result = await calculateServiceCost(serviceCode, region, inputs);
-    const templateId = def.templates?.[0]?.id || null;
+    const result = await calculateServiceCost(serviceCode, region, inputs, activeTemplateId);
 
     const lines = [`🔧 ${def.serviceName} (${REGION_NAMES[region] || region})`];
     if (result) {
@@ -621,7 +661,7 @@ Returns the calculated monthly/upfront costs and the formatted calculationCompon
       calculationComponents: result?.calculationComponents || cc,
       summary: lines.slice(0, 3).join("\n"),
     };
-    if (templateId) response.templateId = templateId;
+    if (activeTemplateId) response.templateId = activeTemplateId;
 
     return {
       content: [{
@@ -730,7 +770,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
       let monthlyCost = svc.monthlyCost || 0;
       let upfrontCost = svc.upfrontCost || 0;
       if (monthlyCost === 0) {
-        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {});
+        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {}, templateId);
         if (calcResult) {
           monthlyCost = calcResult.monthly;
           upfrontCost = upfrontCost || calcResult.upfront;
@@ -947,5 +987,17 @@ server.tool(
   }
 );
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
+export {
+  extractInputs,
+  buildCalcComponents,
+  normalizeValue,
+  evalDisplayIf,
+  executeMathsSection,
+  calculateServiceCostFromDefinition,
+  calculateServiceCost,
+};
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
