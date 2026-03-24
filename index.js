@@ -46,13 +46,8 @@ const REGION_NAMES = {
   "mx-central-1": "Mexico (Central)",
 };
 
-// Redirect legacy/alternate service codes to the ones the calculator UI expects
+// Redirect legacy service codes to loader parents for sub-definition resolution
 const SERVICE_REDIRECTS = {
-  eC2Next: "ec2Enhancement",
-  EC2: "ec2Enhancement",
-  EC2DedicatedHosts: "ec2Enhancement",
-  amazonEc2DedicatedHosts: "ec2Enhancement",
-  // Legacy S3 (simple layout) → modern S3 Standard (used by calculator UI)
   amazonS3: "amazonSimpleStorageServiceGroup",
 };
 
@@ -1140,7 +1135,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
       let monthlyCost = svc.monthlyCost || 0;
       let upfrontCost = svc.upfrontCost || 0;
       if (monthlyCost === 0) {
-        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {}, templateId);
+        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {}, svc.templateId || templateHint);
         if (calcResult) {
           monthlyCost = calcResult.monthly;
           upfrontCost = upfrontCost || calcResult.upfront;
