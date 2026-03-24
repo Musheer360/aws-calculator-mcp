@@ -1056,32 +1056,33 @@ Optionally provide a 'group' name for each service to organize them into groups.
 
       // Try to fetch service definition for version, structure, and input schema
       let serviceCode = svc.serviceCode;
-      // Redirect EC2 variants to ec2Enhancement for editable estimates
+      // Redirect deprecated service codes for editable estimates
       const redirectedCode = SERVICE_REDIRECTS[serviceCode];
       if (redirectedCode) serviceCode = redirectedCode;
       let version = "0.0.1", estimateFor = serviceCode, subServices = undefined;
-      let templateId = svc.templateId || null;
+      // Agent's templateId is a hint for which template to use, not the final value
+      let templateHint = svc.templateId || null;
+      let templateId = null;
       let inputs = [];
       try {
         const def = await fetchJSON(API.serviceDef(serviceCode));
         version = def.version || version;
-        // Auto-detect templateId from service definition (use first template)
-        if (!templateId && def.templates?.length > 0) {
-          if (def.layout === "loader" && typeof def.templates[0] === "string") {
-            // Loader layout (e.g., S3): use the sub-definition's serviceCode and template ID
-            // so the calculator UI can load the correct edit form
-            const subCode = def.defaultTemplates?.[0] || def.templates[0];
-            try {
-              const subDef = await fetchJSON(API.serviceDef(subCode));
-              templateId = subDef.templates?.[0]?.id || null;
-              serviceCode = subCode;
-              version = subDef.version || version;
-            } catch { templateId = null; }
-          } else {
-            templateId = def.templates[0].id || null;
-          }
+        // Resolve the correct templateId and serviceCode from the definition
+        if (def.layout === "loader" && def.templates?.length > 0 && typeof def.templates[0] === "string") {
+          // Loader layout (S3, ELB, DynamoDB): resolve to sub-definition
+          const subCode = templateHint || def.defaultTemplates?.[0] || def.templates[0];
+          try {
+            const subDef = await fetchJSON(API.serviceDef(subCode));
+            templateId = subDef.templates?.[0]?.id || null;
+            serviceCode = subCode;
+            version = subDef.version || version;
+          } catch { templateId = null; }
+        } else if (def.templates?.length > 0) {
+          // Simple layout: find matching template or use first
+          const match = templateHint && def.templates.find(t => t.id === templateHint);
+          templateId = match ? match.id : def.templates[0].id || null;
         }
-        // estimateFor = template ID (what the calculator UI uses)
+        // estimateFor = template ID (what the calculator UI uses for rehydration)
         estimateFor = templateId || serviceCode;
         inputs = extractInputs(def, templateId);
         // For loader layout, extract inputs from the sub-definition
