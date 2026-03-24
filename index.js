@@ -46,8 +46,20 @@ const REGION_NAMES = {
   "mx-central-1": "Mexico (Central)",
 };
 
+// Redirect legacy/alternate service codes to the ones the calculator UI expects
+const SERVICE_REDIRECTS = {
+  eC2Next: "ec2Enhancement",
+  EC2: "ec2Enhancement",
+  EC2DedicatedHosts: "ec2Enhancement",
+  amazonEc2DedicatedHosts: "ec2Enhancement",
+  // Legacy S3 (simple layout) → modern S3 Standard (used by calculator UI)
+  amazonS3: "amazonSimpleStorageServiceGroup",
+};
+
 const FILE_SIZE_TO_GB = { KB: 1 / (1024 * 1024), MB: 1 / 1024, GB: 1, TB: 1024 };
-const FREQ_TO_MONTH = { "per second": 2592000, "per minute": 43200, "per hour": 720, "per day": 30, "per week": 30 / 7, "per month": 1, "per year": 1 / 12 };
+const FREQ_TO_MONTH = { "per second": 2592000, "per minute": 43200, "per hour": 720, "per day": 30, "per week": 30 / 7, "per month": 1, "per year": 1 / 12, perSecond: 2592000, perMinute: 43200, perHour: 720, perDay: 30, perWeek: 30 / 7, perMonth: 1, perYear: 1 / 12, millionPerMonth: 1e6, thousandPerMonth: 1e3, billionPerMonth: 1e9, hundredThousandPerMonth: 1e5, millionPerDay: 1e6 * 30, thousandPerDay: 1e3 * 30, millionPerHour: 1e6 * 720, thousandPerHour: 1e3 * 720 };
+const DURATION_TO_HOURS = { sec: 1 / 3600, min: 1 / 60, hr: 1, day: 24, week: 168, month: 730 };
+const THROUGHPUT_TO_MBPS = { kbps: 1 / 1024, mbps: 1, gbps: 1024 };
 
 let manifestCache = null;
 const pricingCache = {};
@@ -81,9 +93,9 @@ function extractInputs(def, templateId) {
           label: comp.label,
           type: comp.subType || comp.type,
           description: comp.description || "",
-          default: comp.defaultValue ?? comp.value ?? null,
+          default: comp.defaultValue ?? comp.value ?? comp.defaultDropDownItem ?? null,
           unit: comp.unit || null,
-          options: comp.options?.map((o) => ({ label: o.label || o.value, value: o.value })) || null,
+          options: comp.options?.map((o) => ({ label: o.label || o.value, value: o.value || o.id || "" })) || null,
         };
         
         // Add format hints and unit info for frequency/fileSize types
@@ -96,6 +108,14 @@ function extractInputs(def, templateId) {
             field.defaultUnit = field.unit;
             field.format = `value in ${field.unit}`;
           }
+        }
+        
+        // Add unit info for durationInput and throughput types
+        if (field.type === "durationInput" && comp.defaultDuration) {
+          field.defaultUnit = comp.defaultDuration;
+        }
+        if (field.type === "throughput" && comp.defaultThroughput) {
+          field.defaultUnit = comp.defaultThroughput;
         }
         
         // Handle pricingStrategy components (e.g., EC2 savings plans)
@@ -199,7 +219,7 @@ function buildComponentValue(input, value) {
   if (input.type === "pricingStrategy" && typeof value === "object" && value !== null && !("value" in value)) {
     return value;
   }
-  if ((input.type === "frequency" || input.type === "fileSize") && input.defaultUnit) {
+  if ((input.type === "frequency" || input.type === "fileSize" || input.type === "durationInput" || input.type === "throughput") && input.defaultUnit) {
     return { value, unit: input.defaultUnit };
   }
   return { value };
@@ -216,10 +236,16 @@ function normalizeValue(subType, raw) {
     const v = hasNumericValue ? parsed : rawValue;
     const unit = raw.unit;
     if (subType === "fileSize" && unit && FILE_SIZE_TO_GB[unit] != null && hasNumericValue) return parsed * FILE_SIZE_TO_GB[unit];
-    if (subType === "frequency" && unit && FREQ_TO_MONTH[unit] != null && hasNumericValue) return parsed * FREQ_TO_MONTH[unit];
+    if (subType === "frequency" && unit && hasNumericValue) {
+      if (FREQ_TO_MONTH[unit] != null) return parsed * FREQ_TO_MONTH[unit];
+    }
+    if (subType === "utilization" && hasNumericValue) return parsed / 100 * 730;
+    if (subType === "durationInput" && unit && DURATION_TO_HOURS[unit] != null && hasNumericValue) return parsed * DURATION_TO_HOURS[unit];
+    if (subType === "throughput" && unit && THROUGHPUT_TO_MBPS[unit] != null && hasNumericValue) return parsed * THROUGHPUT_TO_MBPS[unit];
+    if (subType === "percentInput" && hasNumericValue) return parsed / 100;
     return v;
   }
-  if (typeof raw === "number") return raw;
+  if (typeof raw === "number") return (subType === "utilization") ? raw / 100 * 730 : (subType === "percentInput") ? raw / 100 : raw;
   if (typeof raw === "string") {
     const parsed = Number(raw);
     return Number.isFinite(parsed) ? parsed : raw;
@@ -237,9 +263,13 @@ async function fetchPricingForService(def, regionName, templateId = null) {
   }
 
   const mappingDefs = new Set();
+  let hasEc2PriceFetcher = false;
+  let columnFormIPMDef = null;
   function walkForMappings(comps) {
     for (const c of comps || []) {
       if (c.mappingDefinitionName) mappingDefs.add(c.mappingDefinitionName);
+      if (c.subType === "ec2PriceFetcher") hasEc2PriceFetcher = true;
+      if (c.subType === "columnFormIPM" && c.mappingDefinitionName) columnFormIPMDef = c.mappingDefinitionName;
       if (c.components) walkForMappings(c.components);
     }
   }
@@ -270,6 +300,56 @@ async function fetchPricingForService(def, regionName, templateId = null) {
       result[name] = {};
     }
   }));
+
+  // Fetch EC2 instance pricing if ec2PriceFetcher is present
+  if (hasEc2PriceFetcher) {
+    const cacheKey = `__ec2__${regionName}`;
+    if (pricingCache[cacheKey]) {
+      result.__ec2 = pricingCache[cacheKey];
+    } else {
+      try {
+        const data = await fetchJSON("https://calculator.aws/pricing/2.0/meteredUnitMaps/ec2/USD/current/ec2.json");
+        const regionData = data.regions?.[regionName] || {};
+        const priceMap = {};
+        for (const [unit, info] of Object.entries(regionData)) {
+          priceMap[unit] = parseFloat(info.price) || 0;
+        }
+        pricingCache[cacheKey] = priceMap;
+        result.__ec2 = priceMap;
+      } catch {
+        result.__ec2 = {};
+      }
+    }
+  }
+
+  // Fetch columnFormIPM on-demand pricing data
+  if (columnFormIPMDef) {
+    // Derive the on-demand endpoint name from the calc name (e.g., "rds-mysql-calc" → "rds-mysql-ondemand")
+    const ondemandName = columnFormIPMDef.replace(/-calc$/, "-ondemand");
+    const ondemandUrl = mappingUrls[ondemandName];
+    if (ondemandUrl && !result[ondemandName]) {
+      const cacheKey = `${ondemandName}__${regionName}`;
+      if (pricingCache[cacheKey]) {
+        result[ondemandName] = pricingCache[cacheKey];
+      } else {
+        try {
+          const data = await fetchJSON(ondemandUrl);
+          const regionData = data.regions?.[regionName] || {};
+          const priceMap = {};
+          for (const [unit, info] of Object.entries(regionData)) {
+            priceMap[unit] = parseFloat(info.price) || 0;
+            // Also store extra attributes (Instance Type, vCPU, Memory) for columnFormIPM lookups
+            if (info["Instance Type"]) priceMap[`__attr__${unit}`] = info;
+          }
+          pricingCache[cacheKey] = priceMap;
+          result[ondemandName] = priceMap;
+        } catch {
+          result[ondemandName] = {};
+        }
+      }
+    }
+  }
+
   return result;
 }
 
@@ -286,7 +366,10 @@ function resolveAllComponents(def, pricingByDef, calculationComponents, template
   function walkPricing(comps) {
     for (const c of comps || []) {
       if (c.type === "pricing" || c.subType === "replace" || c.subType === "singlePricePoint" ||
-          c.subType === "pricingComboV2" || c.subType === "tieredPricing") {
+          c.subType === "pricingComboV2" || c.subType === "tieredPricing" ||
+          c.subType === "ec2PriceFetcher" || c.subType === "priceSelector" ||
+          c.subType === "columnFormIPM" || c.subType === "concatenate" ||
+          c.subType === "dataTransferV2") {
         pricingComps.push(c);
       }
       if (c.components) walkPricing(c.components);
@@ -317,18 +400,157 @@ function resolveAllComponents(def, pricingByDef, calculationComponents, template
   for (const [id, raw] of Object.entries(calculationComponents)) {
     const inputDef = inputDefs[id];
     const subType = inputDef?.subType || inputDef?.type || "";
-    ctx[id] = normalizeValue(subType, raw);
+    // Preserve complex objects (columnFormIPM, pricingStrategy) as-is
+    if (subType === "columnFormIPM" || subType === "pricingStrategy") {
+      ctx[id] = raw;
+    } else {
+      // For frequency fields, resolve unit labels (e.g., "million per month") to option IDs (e.g., "perMonth" or "millionPerMonth")
+      let resolved = raw;
+      if (subType === "frequency" && inputDef?.options && typeof raw === "object" && raw !== null && "unit" in raw) {
+        const unitMatch = inputDef.options.find(o => o.label === raw.unit || o.id === raw.unit);
+        if (unitMatch && unitMatch.id !== raw.unit) {
+          resolved = { ...raw, unit: unitMatch.id };
+        }
+      }
+      ctx[id] = normalizeValue(subType, resolved);
+    }
   }
 
-  // Resolve replace components first
-  for (const c of pricingComps) {
-    if (c.subType === "replace" && c.id) {
-      const inputVal = String(ctx[c.originalId] ?? "");
-      let resolved = "";
-      for (const r of c.replacements || []) {
-        if (String(r.originalString) === inputVal) { resolved = r.replaceString; break; }
+  // Zero out inputs whose displayIf condition evaluates to false
+  // (e.g., IOPS inputs when gp2 storage is selected)
+  for (const [id, inputDef] of Object.entries(inputDefs)) {
+    if (inputDef.displayIf && id in ctx) {
+      if (!evalDisplayIf(inputDef.displayIf, ctx, pricingByDef)) {
+        const val = ctx[id];
+        if (typeof val === "number") ctx[id] = 0;
       }
-      ctx[c.id] = resolved;
+    }
+  }
+
+  // Resolve columnFormIPM first (exports values needed by replace/concatenate)
+  for (const c of pricingComps) {
+    if (c.subType === "columnFormIPM" && c.id) {
+      const rawInput = ctx[c.id];
+      // Unwrap {value: {...}} wrapper from buildCalcComponents
+      const ipmInput = (rawInput && typeof rawInput === "object" && "value" in rawInput && typeof rawInput.value === "object") ? rawInput.value : rawInput;
+      const calcId = c.calculationId || {};
+      const ondemandName = (c.mappingDefinitionName || "").replace(/-calc$/, "-ondemand");
+      const ondemandMap = pricingByDef[ondemandName] || {};
+
+      const instanceType = ipmInput?.["Instance Type"] || ctx.instanceType || "";
+      const deployment = ipmInput?.["Deployment Option"] || ctx.deploymentStrategy || "Single-AZ";
+      const termType = ipmInput?.["TermType"] || ctx.pricingModel || "OnDemand";
+      const nodes = Number(ipmInput?.["Number of Nodes"] || ctx.count || 1);
+
+      // Export values that other components depend on
+      for (const row of c.row || []) {
+        if (row.exportValueAs && ipmInput?.[row.selectorId] != null) {
+          ctx[row.exportValueAs] = ipmInput[row.selectorId];
+        }
+      }
+      if (!ctx.count) ctx.count = nodes;
+      if (!ctx.deploymentStrategy) ctx.deploymentStrategy = deployment;
+
+      // Look up price from on-demand pricing data
+      if (termType === "OnDemand") {
+        let hourlyPrice = 0;
+        // Instance type in pricing keys uses space for first separator (e.g., "db t3.medium" not "db.t3.medium")
+        const instLower = instanceType.toLowerCase().replace(".", " ");
+        const deplLower = deployment.toLowerCase();
+        for (const [key, price] of Object.entries(ondemandMap)) {
+          if (key.startsWith("__attr__")) continue;
+          const keyLower = key.toLowerCase();
+          if (keyLower.includes(instLower) && keyLower.includes(deplLower)) {
+            hourlyPrice = price;
+            break;
+          }
+        }
+        ctx[calcId.monthly || "monthly_ipm"] = hourlyPrice * 730 * nodes;
+        ctx[calcId.upfront || "upfront_ipm"] = 0;
+      }
+    }
+  }
+
+  // Resolve concatenate and replace with two passes to handle both dependency orders:
+  // Fargate: concatenate → replace → pricingComboV2
+  // RDS: replace → concatenate → pricingComboV2
+  for (let pass = 0; pass < 2; pass++) {
+    for (const c of pricingComps) {
+      if (c.subType === "concatenate" && c.id) {
+        let result = "";
+        for (const op of c.operands || []) {
+          if ("constant" in op) result += String(op.constant);
+          else if (op.variableId) result += String(ctx[op.variableId] ?? "");
+        }
+        ctx[c.id] = result;
+      }
+    }
+    for (const c of pricingComps) {
+      if (c.subType === "replace" && c.id) {
+        const inputVal = String(ctx[c.originalId] ?? "");
+        let resolved = "";
+        for (const r of c.replacements || []) {
+          if (String(r.originalString) === inputVal) { resolved = r.replaceString; break; }
+        }
+        ctx[c.id] = resolved;
+      }
+    }
+  }
+
+  // Resolve dataTransferV2 components (tiered outbound data transfer pricing)
+  for (const c of pricingComps) {
+    if (c.subType === "dataTransferV2" && c.id) {
+      const priceMap = pricingByDef[c.mappingDefinitionName] || {};
+      const rawInput = ctx[c.id];
+      // Input can be a number (GB) or object with outbound/inbound amounts
+      const outboundGB = typeof rawInput === "number" ? rawInput :
+        (typeof rawInput === "object" && rawInput !== null ? Number(rawInput.outbound || rawInput.value || 0) : Number(rawInput) || 0);
+      // Apply tiered outbound pricing
+      const tiers = Object.entries(priceMap)
+        .filter(([k]) => k.toLowerCase().includes("external outbound") || k.toLowerCase().includes("outbound next") || k.toLowerCase().includes("outbound greater"))
+        .sort((a, b) => b[1] - a[1]); // highest price first = first tier
+      let cost = 0;
+      if (tiers.length > 0) {
+        // Standard AWS tiers: first 10TB, next 40TB, next 100TB, >150TB
+        const tierSizes = [10 * 1024, 40 * 1024, 100 * 1024, Infinity];
+        let remaining = outboundGB;
+        for (let i = 0; i < tiers.length && remaining > 0; i++) {
+          const qty = Math.min(remaining, tierSizes[i] || Infinity);
+          cost += qty * tiers[i][1];
+          remaining -= qty;
+        }
+      }
+      ctx[c.id] = cost;
+    }
+  }
+
+  // Resolve EC2 priceSelector components using ec2PriceFetcher data
+  const ec2PriceMap = pricingByDef.__ec2 || {};
+  for (const c of pricingComps) {
+    if (c.subType === "priceSelector" && c.id) {
+      const generateFor = c.pricing?.generatePriceFor || [];
+      const pricingStrategy = ctx.pricingStrategy;
+      const model = typeof pricingStrategy === "object" ? pricingStrategy?.model : pricingStrategy;
+      if (generateFor.includes(model) || generateFor.includes("ondemand")) {
+        const instanceType = ctx.instanceType;
+        const os = ctx.selectedOS || "Linux";
+        if (generateFor.includes("ondemand") && model === "ondemand") {
+          // Case-insensitive lookup: try exact key first, then search
+          const key = `OnDemand ${os}-instancetype-${instanceType}`;
+          let price = ec2PriceMap[key];
+          if (price == null) {
+            const keyLower = key.toLowerCase();
+            for (const [k, v] of Object.entries(ec2PriceMap)) {
+              if (k.toLowerCase() === keyLower) { price = v; break; }
+            }
+          }
+          ctx[c.id] = price ?? 0;
+        } else if (!generateFor.includes("ondemand")) {
+          ctx[c.id] = 0;
+        }
+      } else {
+        ctx[c.id] = 0;
+      }
     }
   }
 
@@ -346,12 +568,49 @@ function resolveAllComponents(def, pricingByDef, calculationComponents, template
       ctx[c.id] = typeof unit === "string" ? (priceMap[unit] ?? 0) : 0;
     } else if (c.subType === "tieredPricing" && c.id) {
       const tiers = c.tiers?.allRegions || [];
-      const resolvedTiers = tiers.map((t) => ({
+      const allExactMatch = tiers.every(t => (priceMap[t.meteredUnit] ?? undefined) !== undefined);
+      let fallbackPrices = null;
+      if (!allExactMatch && Object.keys(priceMap).length > 0) {
+        // Extract a keyword from tier metered unit names (e.g., "Standard" from "General Purpose Standard 0")
+        // and find matching pricing entries sorted by price descending (first tier = highest price)
+        const firstTierName = tiers[0]?.meteredUnit || "";
+        const words = firstTierName.replace(/\d+/g, "").trim().split(/\s+/);
+        const keyword = words[words.length - 1]?.toLowerCase() || "";
+        if (keyword) {
+          fallbackPrices = Object.entries(priceMap)
+            .filter(([k]) => k.toLowerCase().includes(keyword) && k.toLowerCase().includes("per") && k.toLowerCase().includes("mo"))
+            .sort((a, b) => b[1] - a[1]);
+        }
+      }
+      const resolvedTiers = tiers.map((t, i) => ({
         start: t.startOfTier,
         end: t.endOfTier,
-        price: priceMap[t.meteredUnit] ?? 0,
+        price: priceMap[t.meteredUnit] ?? (fallbackPrices?.[i]?.[1] ?? 0),
       }));
       ctx[`__tiers__${c.id}`] = resolvedTiers;
+    }
+  }
+
+  // Auto-resolve request pricing for numeric inputs that match pricing entries
+  // (e.g., S3 PUT/GET requests where the definition lacks explicit math)
+  for (const [id, inputDef] of Object.entries(inputDefs)) {
+    if (inputDef.subType !== "numericInput" || !inputDef.label) continue;
+    const label = inputDef.label.toLowerCase();
+    if (!label.includes("request")) continue;
+    // Find a matching pricing entry across all pricing maps
+    for (const [defName, priceMap] of Object.entries(pricingByDef)) {
+      if (defName.startsWith("__")) continue;
+      for (const [key, price] of Object.entries(priceMap)) {
+        if (!key.toLowerCase().includes("request")) continue;
+        // Match by first keyword (PUT, GET, etc.)
+        const inputFirstWord = label.split(/[\s/]/)[0];
+        const keyFirstWord = key.split(/[\s/]/)[0];
+        if (inputFirstWord === keyFirstWord.toLowerCase()) {
+          const qty = Number(ctx[id]) || 0;
+          ctx[`__requestCost__${id}`] = qty * price;
+          break;
+        }
+      }
     }
   }
 
@@ -377,6 +636,19 @@ function evalDisplayIf(condition, context, pricingByDef) {
     if (Array.isArray(parts) && parts.length === 2) {
       const left = parts[0]?.type === "component" ? context[parts[0].id] : parts[0];
       return String(left) === String(parts[1]);
+    }
+  }
+  for (const op of [">", "<", ">=", "<="]) {
+    if (condition[op]) {
+      const parts = condition[op];
+      if (Array.isArray(parts) && parts.length === 2) {
+        const left = Number(parts[0]?.type === "component" ? context[parts[0].id] : parts[0]) || 0;
+        const right = Number(parts[1]) || 0;
+        if (op === ">") return left > right;
+        if (op === "<") return left < right;
+        if (op === ">=") return left >= right;
+        if (op === "<=") return left <= right;
+      }
     }
   }
   return true; // default: include
@@ -419,6 +691,7 @@ function executeMathsSection(mathsOps, context, pricingByDef) {
           else if (operation === "addition") result += operands[i];
           else if (operation === "subtraction") result -= operands[i];
           else if (operation === "division") result = operands[i] !== 0 ? result / operands[i] : 0;
+          else if (operation === "exponent") { result = Math.pow(result, operands[i]); break; }
         }
         context[comp.id] = result;
       } else if (st === "maxMin" && comp.id) {
@@ -429,6 +702,7 @@ function executeMathsSection(mathsOps, context, pricingByDef) {
         const factor = Number(comp.factor) || 1;
         if (comp.method === "roundUp") context[comp.id] = Math.ceil(val / factor) * factor;
         else if (comp.method === "roundDown") context[comp.id] = Math.floor(val / factor) * factor;
+        else if (comp.method === "standard") context[comp.id] = Math.round(val / factor) * factor;
         else context[comp.id] = val;
       } else if (st === "tieredPricingMath" && comp.id) {
         const inputVal = Number(context[comp.inputRefer]) || 0;
@@ -445,6 +719,18 @@ function executeMathsSection(mathsOps, context, pricingByDef) {
           remaining -= qty;
         }
         context[comp.id] = total;
+      } else if (st === "variable" && comp.id) {
+        // Assignment: copy value from refer/operand to this variable's id
+        if (comp.refer) context[comp.id] = Number(context[comp.refer]) || 0;
+        else if (comp.operands?.length) context[comp.id] = getVal(comp.operands[0]);
+      } else if (st === "snapShotMaths" && comp.id) {
+        // Snapshot cost: storage * changeRate * frequency * price
+        const ops = comp.operands || [];
+        const storage = getVal(ops.find(o => o.operand === "ebsStorage"));
+        const changed = getVal(ops.find(o => o.operand === "amountSnapShotChanged"));
+        const freq = getVal(ops.find(o => o.operand === "snapShotFrequency"));
+        const price = getVal(ops.find(o => o.operand === "snapShotPricing"));
+        context[comp.id] = (storage + changed * freq) * price;
       }
     }
   }
@@ -477,6 +763,13 @@ function computeCostFromPreparedDefinition(def, regionName, userInputs = {}, tem
     }
   }
 
+  // Add auto-computed request costs (e.g., S3 PUT/GET)
+  for (const [key, val] of Object.entries(ctx)) {
+    if (key.startsWith("__requestCost__") && typeof val === "number") {
+      monthly += val;
+    }
+  }
+
   return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: cc };
 }
 
@@ -505,15 +798,30 @@ async function calculateServiceCost(serviceCode, region, userInputs, templateId 
         } catch { /* skip failed subService */ }
       }
     }
-    defs.push(def);
+
+    // Handle loader layout: templates are string IDs referencing separate service definitions
+    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
+      const loaderTemplates = templateId ? [templateId] : (def.defaultTemplates || def.templates);
+      for (const tmplCode of loaderTemplates) {
+        try {
+          const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
+          defs.push(tmplDef);
+        } catch { /* skip failed loader template */ }
+      }
+    } else {
+      defs.push(def);
+    }
 
     let monthly = 0, upfront = 0;
     let rootCalculationComponents = {};
 
     for (const d of defs) {
-      const pricingByDef = await fetchPricingForService(d, regionName, templateId);
-      const result = computeCostFromPreparedDefinition(d, regionName, userInputs, templateId, pricingByDef);
-      if (d.serviceCode === def.serviceCode) {
+      // For loader sub-definitions, don't pass the parent templateId — use their own first template
+      const subTemplateId = (d.serviceCode === def.serviceCode) ? templateId : null;
+      const pricingByDef = await fetchPricingForService(d, regionName, subTemplateId);
+      const result = computeCostFromPreparedDefinition(d, regionName, userInputs, subTemplateId, pricingByDef);
+      // Collect calculationComponents from the main def or the first loader sub-def
+      if (Object.keys(rootCalculationComponents).length === 0) {
         rootCalculationComponents = result.calculationComponents;
       }
       monthly += result.monthly;
@@ -567,19 +875,44 @@ For frequency/fileSize fields, provide { value: number, unit: "unitString" }.`,
   { serviceCode: z.string().describe("Service code (e.g. 'amazonCloudFront', 'eC2Next')") },
   async ({ serviceCode }) => {
     const def = await fetchJSON(API.serviceDef(serviceCode));
-    const inputs = extractInputs(def);
+    let inputs = extractInputs(def);
     const result = {
       serviceName: def.serviceName,
       serviceCode: def.serviceCode,
       version: def.version,
       layout: def.layout,
-      templates: (def.templates || []).map(t => ({ id: t.id, title: t.title })),
+      templates: [],
       subServices: [],
       inputs,
     };
+
+    // Handle loader layout: templates are string IDs referencing separate service definitions
+    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
+      result.templates = def.templates.map(id => ({ id, title: id }));
+      result.loaderTemplates = [];
+      for (const tmplCode of def.templates) {
+        try {
+          const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
+          const tmplInputs = extractInputs(tmplDef);
+          result.loaderTemplates.push({
+            serviceCode: tmplCode,
+            serviceName: tmplDef.serviceName,
+            inputs: tmplInputs,
+          });
+        } catch { /* skip */ }
+      }
+      // Use inputs from default template if main def has none
+      if (inputs.length === 0 && result.loaderTemplates.length > 0) {
+        const defaultCode = def.defaultTemplates?.[0];
+        const defaultTmpl = result.loaderTemplates.find(t => t.serviceCode === defaultCode) || result.loaderTemplates[0];
+        result.inputs = defaultTmpl.inputs;
+      }
+    } else {
+      result.templates = (def.templates || []).map(t => ({ id: t.id, title: t.title }));
+    }
     
-    // Issue 4: Add note for loader layout services
-    if (def.layout === "loader" && inputs.length === 0) {
+    // Note for loader layout
+    if (def.layout === "loader" && result.inputs.length === 0) {
       result.note = "This service uses dynamic loading (layout: 'loader'). calculationComponents cannot be auto-populated and should be omitted when creating estimates.";
     }
     
@@ -625,8 +958,19 @@ Returns the calculated monthly/upfront costs and the formatted calculationCompon
   },
   async ({ serviceCode, region, templateId, inputs }) => {
     const def = await fetchJSON(API.serviceDef(serviceCode));
-    const activeTemplateId = templateId || def.templates?.[0]?.id || null;
-    const allInputs = extractInputs(def, activeTemplateId);
+    let activeTemplateId = templateId || def.templates?.[0]?.id || null;
+    let allInputs = extractInputs(def, activeTemplateId);
+
+    // For loader layout, fetch the actual template definition for input extraction
+    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
+      const tmplCode = templateId || def.defaultTemplates?.[0] || def.templates[0];
+      activeTemplateId = tmplCode;
+      try {
+        const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
+        allInputs = extractInputs(tmplDef);
+      } catch { /* use empty inputs */ }
+    }
+
     const cc = buildCalcComponents(allInputs, inputs);
     const result = await calculateServiceCost(serviceCode, region, inputs, activeTemplateId);
 
@@ -711,18 +1055,42 @@ Optionally provide a 'group' name for each service to organize them into groups.
       let cc = {};
 
       // Try to fetch service definition for version, structure, and input schema
-      let version = "0.0.1", estimateFor = svc.serviceCode, subServices = undefined;
+      let serviceCode = svc.serviceCode;
+      // Redirect EC2 variants to ec2Enhancement for editable estimates
+      const redirectedCode = SERVICE_REDIRECTS[serviceCode];
+      if (redirectedCode) serviceCode = redirectedCode;
+      let version = "0.0.1", estimateFor = serviceCode, subServices = undefined;
       let templateId = svc.templateId || null;
       let inputs = [];
       try {
-        const def = await fetchJSON(API.serviceDef(svc.serviceCode));
+        const def = await fetchJSON(API.serviceDef(serviceCode));
         version = def.version || version;
-        estimateFor = def.estimateFor || def.serviceCode;
         // Auto-detect templateId from service definition (use first template)
         if (!templateId && def.templates?.length > 0) {
-          templateId = def.templates[0].id || null;
+          if (def.layout === "loader" && typeof def.templates[0] === "string") {
+            // Loader layout (e.g., S3): use the sub-definition's serviceCode and template ID
+            // so the calculator UI can load the correct edit form
+            const subCode = def.defaultTemplates?.[0] || def.templates[0];
+            try {
+              const subDef = await fetchJSON(API.serviceDef(subCode));
+              templateId = subDef.templates?.[0]?.id || null;
+              serviceCode = subCode;
+              version = subDef.version || version;
+            } catch { templateId = null; }
+          } else {
+            templateId = def.templates[0].id || null;
+          }
         }
+        // estimateFor = template ID (what the calculator UI uses)
+        estimateFor = templateId || serviceCode;
         inputs = extractInputs(def, templateId);
+        // For loader layout, extract inputs from the sub-definition
+        if (inputs.length === 0 && def.layout === "loader" && serviceCode !== svc.serviceCode) {
+          try {
+            const subDef = await fetchJSON(API.serviceDef(serviceCode));
+            inputs = extractInputs(subDef, templateId);
+          } catch { /* use empty inputs */ }
+        }
 
         // If service has subServices in its definition, build them properly
         if (def.subServices?.length) {
@@ -730,12 +1098,13 @@ Optionally provide a 'group' name for each service to organize them into groups.
           for (const sub of def.subServices) {
             try {
               const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
+              const subTemplateId = subDef.templates?.[0]?.id || null;
               const subInputs = extractInputs(subDef);
               const subCC = buildCalcComponents(subInputs);
               subServices.push({
                 serviceCode: sub.serviceCode,
                 region: svc.region,
-                estimateFor: subDef.estimateFor || sub.serviceCode,
+                estimateFor: subTemplateId || sub.serviceCode,
                 version: subDef.version || "0.0.1",
                 description: null,
                 calculationComponents: subCC,
@@ -779,7 +1148,7 @@ Optionally provide a 'group' name for each service to organize them into groups.
 
       const entry = {
         version,
-        serviceCode: svc.serviceCode,
+        serviceCode,
         estimateFor,
         region: svc.region,
         description: svc.description || null,
