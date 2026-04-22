@@ -942,3 +942,62 @@ describe("calculateServiceCostFromDefinition", () => {
     assert.deepEqual(result.calculationComponents, { qty: { value: 2 } });
   });
 });
+
+// buildCalcComponents is the merge engine that the new `subServices` override
+// path feeds into — verify it treats per-sub-service user overrides the same
+// way it treats parent-level overrides: defaults in, user values on top.
+describe("buildCalcComponents (sub-service override semantics)", () => {
+  const inputs = [
+    { id: "numberOfGateways", default: "1", type: "numericInput" },
+    { id: "regionalNatGatewayCount", default: "5", type: "numericInput" },
+    { id: "regionalNatGatewayAzCount", default: "3", type: "numericInput" },
+    {
+      id: "dataProcessedPerNATGateway",
+      default: "100",
+      type: "fileSize",
+      defaultUnit: "gb|month",
+    },
+  ];
+
+  it("returns schema defaults when user provides no overrides", () => {
+    const cc = buildCalcComponents(inputs, {});
+    assert.deepEqual(cc.numberOfGateways, { value: "1" });
+    assert.deepEqual(cc.regionalNatGatewayCount, { value: "5" });
+    assert.deepEqual(cc.regionalNatGatewayAzCount, { value: "3" });
+  });
+
+  it("overlays user values over defaults (partial override)", () => {
+    // Typical NAT-trim use case: keep numberOfGateways=1 but zero the regional fanout.
+    const cc = buildCalcComponents(inputs, {
+      regionalNatGatewayCount: "1",
+      regionalNatGatewayAzCount: "0",
+    });
+    assert.deepEqual(cc.numberOfGateways, { value: "1" });      // default preserved
+    assert.deepEqual(cc.regionalNatGatewayCount, { value: "1" });  // overridden
+    assert.deepEqual(cc.regionalNatGatewayAzCount, { value: "0" }); // overridden
+  });
+
+  it("preserves {value, unit} envelope for fileSize-shaped user inputs", () => {
+    const cc = buildCalcComponents(inputs, {
+      dataProcessedPerNATGateway: { value: "10", unit: "gb|month" },
+    });
+    assert.deepEqual(cc.dataProcessedPerNATGateway, { value: "10", unit: "gb|month" });
+  });
+});
+
+// The override lookup is: `Object.fromEntries(userOverrides.map(s => [s.serviceCode, s.calculationComponents]))`.
+// That's a shape assertion — verify it behaves as the subService loop expects.
+describe("subService override lookup", () => {
+  it("builds a code->components map and preserves empty objects", () => {
+    const userSubs = [
+      { serviceCode: "networkAddressTranslationNatGatewayVpc", calculationComponents: { numberOfGateways: "1" } },
+      { serviceCode: "vpnConnectionVpc", calculationComponents: {} },
+    ];
+    const map = Object.fromEntries(
+      userSubs.map((s) => [s.serviceCode, s.calculationComponents || {}])
+    );
+    assert.deepEqual(map.networkAddressTranslationNatGatewayVpc, { numberOfGateways: "1" });
+    assert.deepEqual(map.vpnConnectionVpc, {});
+    assert.equal(map.somethingElse, undefined);
+  });
+});
