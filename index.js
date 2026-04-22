@@ -1019,7 +1019,10 @@ Each service needs: serviceCode, region, serviceName. monthlyCost is auto-calcul
 Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.
 Use the 'value' field (not the 'label') from option objects returned by get_service_schema.
 For frequency/fileSize fields, provide { value: number, unit: "unitString" }.
-Optionally provide a 'group' name for each service to organize them into groups.`,
+Optionally provide a 'group' name for each service to organize them into groups.
+For services that use sub-services (e.g. VPC's NAT gateway + VPN, S3's storage + data transfer), provide
+'subServices' as an array of { serviceCode, calculationComponents } — each entry overrides the schema
+defaults for that sub-service only. Sub-service codes are listed on get_service_schema for the parent.`,
   {
     name: z.string().describe("Estimate name"),
     services: z
@@ -1036,6 +1039,15 @@ Optionally provide a 'group' name for each service to organize them into groups.
           calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
           templateId: z.string().optional().describe("Template ID for the service (auto-detected if not provided). Controls which configuration form is shown when editing."),
           group: z.string().optional().describe("Group name to organize this service under"),
+          subServices: z
+            .array(
+              z.object({
+                serviceCode: z.string().describe("Sub-service code (e.g. 'networkAddressTranslationNatGatewayVpc'). Discoverable via get_service_schema on the parent."),
+                calculationComponents: z.record(z.any()).describe("calculationComponents for the sub-service. Merged over schema defaults; same field-key conventions as the parent."),
+              })
+            )
+            .optional()
+            .describe("Per-sub-service calculationComponents for parents that use sub-services (VPC, S3, ELB, DynamoDB). Match by serviceCode; any sub-services not listed keep their schema defaults."),
         })
       )
       .describe("Array of services to include"),
@@ -1088,15 +1100,21 @@ Optionally provide a 'group' name for each service to organize them into groups.
           } catch { /* use empty inputs */ }
         }
 
-        // If service has subServices in its definition, build them properly
+        // If service has subServices in its definition, build them properly.
+        // User-provided overrides (svc.subServices) are merged over schema defaults,
+        // matched by serviceCode.
         if (def.subServices?.length) {
           subServices = [];
+          const subOverrides = Object.fromEntries(
+            (svc.subServices || []).map((s) => [s.serviceCode, s.calculationComponents || {}])
+          );
           for (const sub of def.subServices) {
+            const userCC = subOverrides[sub.serviceCode] || {};
             try {
               const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
               const subTemplateId = subDef.templates?.[0]?.id || null;
               const subInputs = extractInputs(subDef);
-              const subCC = buildCalcComponents(subInputs);
+              const subCC = buildCalcComponents(subInputs, userCC);
               subServices.push({
                 serviceCode: sub.serviceCode,
                 region: svc.region,
@@ -1107,13 +1125,19 @@ Optionally provide a 'group' name for each service to organize them into groups.
                 serviceCost: { monthly: 0, upfront: 0 },
               });
             } catch {
+              // Fetch failed — still honour user overrides if provided, normalising
+              // bare values to { value: ... } so they round-trip through saveAs.
+              const fallbackCC = {};
+              for (const [k, v] of Object.entries(userCC)) {
+                fallbackCC[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
+              }
               subServices.push({
                 serviceCode: sub.serviceCode,
                 region: svc.region,
                 estimateFor: sub.serviceCode,
                 version: "0.0.1",
                 description: null,
-                calculationComponents: {},
+                calculationComponents: fallbackCC,
                 serviceCost: { monthly: 0, upfront: 0 },
               });
             }
