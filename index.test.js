@@ -1,5 +1,5 @@
 import { describe, it } from "node:test";
-import { calculateServiceCostFromDefinition } from "./index.js";
+import { calculateServiceCostFromDefinition, buildGroupTree, normalizeGroupPath } from "./index.js";
 import assert from "node:assert/strict";
 
 // Most pure helpers are mirrored locally for focused unit tests; exported helpers are imported directly where useful.
@@ -940,5 +940,84 @@ describe("calculateServiceCostFromDefinition", () => {
     assert.equal(result.monthly, 6);
     assert.equal(result.upfront, 0);
     assert.deepEqual(result.calculationComponents, { qty: { value: 2 } });
+  });
+});
+
+describe("normalizeGroupPath", () => {
+  it("returns empty array for undefined / null", () => {
+    assert.deepEqual(normalizeGroupPath(undefined), []);
+    assert.deepEqual(normalizeGroupPath(null), []);
+  });
+  it("wraps a string in a single-element array", () => {
+    assert.deepEqual(normalizeGroupPath("Accounts"), ["Accounts"]);
+  });
+  it("passes through an array and drops empty segments", () => {
+    assert.deepEqual(normalizeGroupPath(["Accounts", "CI/CD"]), ["Accounts", "CI/CD"]);
+    assert.deepEqual(normalizeGroupPath(["Accounts", "", "CI/CD"]), ["Accounts", "CI/CD"]);
+  });
+});
+
+describe("buildGroupTree", () => {
+  // Deterministic id generator so snapshot-style assertions are stable.
+  const makeGen = () => {
+    let n = 0;
+    return () => `group-${++n}`;
+  };
+  const svc = (key, path, monthly, upfront = 0) => ({
+    key,
+    path,
+    entry: {
+      serviceCode: "demo",
+      serviceName: "Demo",
+      serviceCost: { monthly, upfront },
+    },
+  });
+
+  it("returns an empty object when given no services", () => {
+    assert.deepEqual(buildGroupTree([], makeGen()), {});
+  });
+
+  it("places a single-level group at the root with correct subtotal", () => {
+    const tree = buildGroupTree([svc("a", ["Accounts"], 10)], makeGen());
+    assert.deepEqual(Object.keys(tree), ["group-1"]);
+    assert.equal(tree["group-1"].name, "Accounts");
+    assert.equal(tree["group-1"].groupSubtotal.monthly, 10);
+    assert.deepEqual(Object.keys(tree["group-1"].services), ["a"]);
+  });
+
+  it("nests two levels and deduplicates shared ancestors", () => {
+    const tree = buildGroupTree([
+      svc("a", ["Accounts", "CI/CD"], 10),
+      svc("b", ["Accounts", "Development"], 20),
+    ], makeGen());
+    // Should produce a single "Accounts" root group, containing two children.
+    assert.equal(Object.keys(tree).length, 1);
+    const accounts = Object.values(tree)[0];
+    assert.equal(accounts.name, "Accounts");
+    assert.equal(Object.keys(accounts.groups).length, 2);
+    assert.equal(accounts.groupSubtotal.monthly, 30);
+  });
+
+  it("rolls subtotals up through three levels", () => {
+    const tree = buildGroupTree([
+      svc("a", ["Accounts", "Production", "eu-west-1"], 100),
+      svc("b", ["Accounts", "Production", "eu-west-1"], 50),
+      svc("c", ["Accounts", "Production", "eu-west-2"], 25),
+    ], makeGen());
+    const accounts = Object.values(tree)[0];
+    const production = Object.values(accounts.groups)[0];
+    assert.equal(accounts.groupSubtotal.monthly, 175);
+    assert.equal(production.groupSubtotal.monthly, 175);
+    const euw1 = Object.values(production.groups).find((g) => g.name === "eu-west-1");
+    const euw2 = Object.values(production.groups).find((g) => g.name === "eu-west-2");
+    assert.equal(euw1.groupSubtotal.monthly, 150);
+    assert.equal(euw2.groupSubtotal.monthly, 25);
+  });
+
+  it("sums upfront costs alongside monthly", () => {
+    const tree = buildGroupTree([svc("a", ["X"], 10, 500)], makeGen());
+    const x = Object.values(tree)[0];
+    assert.equal(x.groupSubtotal.upfront, 500);
+    assert.equal(x.totalCost.upfront, 500);
   });
 });

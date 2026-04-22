@@ -65,6 +65,55 @@ async function fetchJSON(url) {
   return r.json();
 }
 
+// Build a nested group tree from a list of { key, entry, path } items.
+// Each path is an array of group names (e.g. ["Accounts", "CI/CD"]). Services
+// are placed inline inside their leaf group, matching the recursive-inline
+// format calculator.aws uses when saving multi-level groupings.
+// idGenerator is injectable for deterministic tests.
+function buildGroupTree(groupedSvcs, idGenerator = () => `group-${crypto.randomUUID()}`) {
+  const groupsObj = {};
+  const makeNode = (name) => ({
+    name,
+    services: {},
+    groups: {},
+    groupSubtotal: { monthly: 0, upfront: 0 },
+    totalCost: { monthly: 0, upfront: 0 },
+  });
+  for (const { key, entry, path } of groupedSvcs) {
+    let container = { groups: groupsObj };
+    for (const segment of path) {
+      const existingId = Object.entries(container.groups).find(([, g]) => g.name === segment)?.[0];
+      const gid = existingId || idGenerator();
+      if (!existingId) container.groups[gid] = makeNode(segment);
+      container = container.groups[gid];
+    }
+    container.services[key] = entry;
+  }
+  const rollup = (node) => {
+    let m = 0, u = 0;
+    for (const svc of Object.values(node.services || {})) {
+      m += svc.serviceCost?.monthly || 0;
+      u += svc.serviceCost?.upfront || 0;
+    }
+    for (const child of Object.values(node.groups || {})) {
+      const { monthly, upfront } = rollup(child);
+      m += monthly; u += upfront;
+    }
+    node.groupSubtotal = { monthly: m, upfront: u };
+    node.totalCost = { monthly: m, upfront: u };
+    return { monthly: m, upfront: u };
+  };
+  for (const node of Object.values(groupsObj)) rollup(node);
+  return groupsObj;
+}
+
+// Normalize a service's `group` field to an array path. Accepts string | string[] | undefined.
+function normalizeGroupPath(group) {
+  if (!group) return [];
+  if (Array.isArray(group)) return group.filter(Boolean);
+  return [group];
+}
+
 async function getManifest() {
   if (!manifestCache) {
     manifestCache = fetchJSON(API.manifest).catch(e => {
@@ -1035,14 +1084,14 @@ Optionally provide a 'group' name for each service to organize them into groups.
           configSummary: z.string().optional().describe("Brief config summary shown in the estimate table"),
           calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
           templateId: z.string().optional().describe("Template ID for the service (auto-detected if not provided). Controls which configuration form is shown when editing."),
-          group: z.string().optional().describe("Group name to organize this service under"),
+          group: z.union([z.string(), z.array(z.string())]).optional().describe("Group the service under. Pass a string for a single-level group, or an array of strings for a nested hierarchy (e.g. ['Accounts', 'CI/CD'] creates Accounts > CI/CD)."),
         })
       )
       .describe("Array of services to include"),
   },
   async ({ name, services }) => {
-    const svcMap = {};
-    const groupMap = {}; // Track which services belong to which groups
+    const svcMap = {};      // key -> service entry (used only if service has no group)
+    const groupedSvcs = []; // { key, entry, path: string[] } for services placed inside groups
     let totalMonthly = 0, totalUpfront = 0;
 
     for (const svc of services) {
@@ -1157,26 +1206,18 @@ Optionally provide a 'group' name for each service to organize them into groups.
       if (templateId) entry.templateId = templateId;
       if (subServices) entry.subServices = subServices;
 
-      svcMap[key] = entry;
       totalMonthly += monthlyCost;
       totalUpfront += upfrontCost;
-      
-      // Issue 1: Track group membership
-      if (svc.group) {
-        if (!groupMap[svc.group]) groupMap[svc.group] = [];
-        groupMap[svc.group].push(key);
+
+      const path = normalizeGroupPath(svc.group);
+      if (path.length > 0) {
+        groupedSvcs.push({ key, entry, path });
+      } else {
+        svcMap[key] = entry;
       }
     }
 
-    // Issue 1: Build groups structure from groupMap
-    const groupsObj = {};
-    for (const [groupName, serviceKeys] of Object.entries(groupMap)) {
-      const groupId = `group-${crypto.randomUUID()}`;
-      groupsObj[groupId] = {
-        name: groupName,
-        services: serviceKeys,
-      };
-    }
+    const groupsObj = buildGroupTree(groupedSvcs);
 
     const payload = {
       name,
@@ -1205,19 +1246,23 @@ Optionally provide a 'group' name for each service to organize them into groups.
     
     // Issue 3: Better error handling with response body
     if (!resp.ok) {
-      // Fallback - strip calculationComponents and retry
+      // Fallback - strip calculationComponents everywhere (root services + nested groups) and retry
       const strippedServices = [];
-      for (const [key, svc] of Object.entries(payload.services)) {
+      const stripSvc = (svc) => {
         if (Object.keys(svc.calculationComponents || {}).length > 0) {
           strippedServices.push(svc.serviceName);
         }
         svc.calculationComponents = {};
         if (svc.subServices) {
-          for (const sub of svc.subServices) {
-            sub.calculationComponents = {};
-          }
+          for (const sub of svc.subServices) sub.calculationComponents = {};
         }
-      }
+      };
+      const stripNode = (node) => {
+        for (const svc of Object.values(node.services || {})) stripSvc(svc);
+        for (const child of Object.values(node.groups || {})) stripNode(child);
+      };
+      for (const svc of Object.values(payload.services)) stripSvc(svc);
+      for (const node of Object.values(payload.groups || {})) stripNode(node);
       
       const retryResp = await fetch(API.save, {
         method: "POST",
@@ -1263,16 +1308,25 @@ Optionally provide a 'group' name for each service to organize them into groups.
     ];
     
     if (Object.keys(groupsObj).length > 0) {
-      output.push(`Groups: ${Object.values(groupsObj).map(g => g.name).join(", ")}`);
+      const listGroups = (nodes, prefix = "") => {
+        const lines = [];
+        for (const g of Object.values(nodes)) {
+          lines.push(`${prefix}${g.name} ($${g.groupSubtotal.monthly.toFixed(2)}/mo)`);
+          lines.push(...listGroups(g.groups || {}, prefix + "  "));
+        }
+        return lines;
+      };
+      output.push("Groups:");
+      output.push(...listGroups(groupsObj, "  "));
       output.push("");
     }
-    
+
     output.push(`Services: ${services.length}`);
     for (const [key, entry] of Object.entries(svcMap)) {
-      const groupLabel = entry.serviceName ? "" : "";
-      const svc = services.find(s => entry.serviceCode === s.serviceCode);
-      const grp = svc?.group ? ` [${svc.group}]` : "";
-      output.push(`  • ${entry.serviceName} (${entry.region}): $${entry.serviceCost.monthly.toFixed(2)}/mo${grp}`);
+      output.push(`  • ${entry.serviceName} (${entry.region}): $${entry.serviceCost.monthly.toFixed(2)}/mo`);
+    }
+    for (const { entry, path } of groupedSvcs) {
+      output.push(`  • ${entry.serviceName} (${entry.region}): $${entry.serviceCost.monthly.toFixed(2)}/mo [${path.join(" > ")}]`);
     }
     
     if (warnings.length > 0) {
@@ -1360,6 +1414,8 @@ export {
   executeMathsSection,
   calculateServiceCostFromDefinition,
   calculateServiceCost,
+  buildGroupTree,
+  normalizeGroupPath,
 };
 
 if (import.meta.url === `file://${process.argv[1]}`) {
