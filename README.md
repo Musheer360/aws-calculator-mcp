@@ -1,40 +1,21 @@
 # aws-calculator-mcp
 
-MCP server for creating [AWS Pricing Calculator](https://calculator.aws) estimates programmatically and getting shareable links — no browser automation needed.
+MCP server that creates AWS Pricing Calculator estimates and returns **actual AWS-calculated costs** — not approximations.
 
-Built for AI agents like [Kiro CLI](https://kiro.dev), Claude Desktop, Cursor, or any MCP-compatible client.
+Works with any MCP client: [Kiro](https://kiro.dev), Claude Desktop, Cursor, VS Code, Windsurf, or anything that speaks [MCP](https://modelcontextprotocol.io).
 
-## What it does
+## What makes this different
 
-Creates AWS Pricing Calculator estimates via a single API call and returns a shareable, **editable** `calculator.aws` link that anyone can open — no AWS account required.
+| Feature | This MCP | Others |
+|---------|----------|--------|
+| **Real costs** | Opens calculator.aws in headless Chrome, gets actual per-service pricing | Approximate/local calculations |
+| **Per-service breakdown** | Navigates into each group, scrapes individual service costs | Group totals only |
+| **Update in place** | `update_service` modifies one field without recreating the estimate | Delete and rebuild |
+| **Sub-service resolution** | `elasticLoadBalancing` + `applicationLoadBalancer` auto-resolves | Manual lookup required |
+| **Typo detection** | Invalid field IDs return suggestions: `"storagAmount" → did you mean "storageAmount"?` | Silent failures |
+| **Full reports** | CSV/Markdown with MRR, ARR, per-service costs + all configured attributes | Just a URL |
 
-The MCP fetches real-time AWS pricing data and calculates costs automatically using the same pricing formulas as the official AWS calculator — no manual price lookups needed.
-
-```
-You: "Create an estimate with Lambda (10M requests, 200ms, 512MB) and S3 (100GB) in us-east-1"
-  ↓
-Agent calls configure_service → fetches pricing, calculates costs
-Agent calls create_estimate → POST to calculator.aws API
-  ↓
-Returns: https://calculator.aws/#/estimate?id=abc123...
-  Monthly: $14.19 (Lambda: $11.80 + S3: $2.39)
-```
-
-One HTTP call. No browser. No auth. Real-time pricing. ~2 seconds.
-
-## Tools
-
-| Tool | Description |
-|------|-------------|
-| `search_services` | Search 400+ AWS services by keyword → returns `serviceCode` |
-| `get_service_schema` | Get input fields for any service (including subServices) |
-| `configure_service` | Configure a service with specific parameters → auto-calculates cost using real-time AWS pricing |
-| `create_estimate` | Create estimate with services → returns shareable, editable link (auto-calculates costs) |
-| `load_estimate` | Load existing estimate from URL → returns full data |
-
-## Setup
-
-### Install
+## Quick Start
 
 ```bash
 git clone https://github.com/Musheer360/aws-calculator-mcp.git
@@ -42,126 +23,155 @@ cd aws-calculator-mcp
 npm install
 ```
 
-### Configure with Kiro CLI
+### MCP Client Config
 
-Add to `~/.kiro/settings/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "aws-calculator": {
-      "command": "node",
-      "args": ["/path/to/aws-calculator-mcp/index.js"]
-    }
-  }
-}
-```
-
-Or via CLI:
-
-```bash
-kiro-cli mcp add --name aws-calculator --command node --args /path/to/aws-calculator-mcp/index.js
-```
-
-### Configure with Claude Desktop
-
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Add to your MCP settings (e.g. `~/.kiro/settings/mcp.json`, Claude Desktop config, etc.):
 
 ```json
 {
   "mcpServers": {
     "aws-calculator": {
       "command": "node",
-      "args": ["/path/to/aws-calculator-mcp/index.js"]
+      "args": ["/path/to/aws-calculator-mcp/mcp-server.js"]
     }
   }
 }
 ```
 
-## Usage Examples
+No AWS credentials needed. No API keys. No account required.
 
-### Recommended workflow (like the AWS Calculator website)
+## Tools (12)
 
-The recommended workflow mirrors how the AWS Calculator website works — add services one at a time, configure them, get the calculated price, then create the estimate:
-
-```
-1. "Search for Lambda" → search_services
-2. "Configure Lambda with 10M requests, 200ms duration, 512MB memory" → configure_service
-   → Returns: $11.80/month with calculationComponents
-3. "Also add S3 Standard with 100GB storage" → configure_service
-   → Returns: $2.39/month with calculationComponents
-4. "Create the estimate" → create_estimate
-   → Returns shareable link with auto-calculated costs
-```
-
-### Create an estimate with auto-calculated costs
+### Core Workflow
 
 ```
-Create an AWS pricing estimate called "My App" with:
-- AWS Lambda in us-east-1: 10M requests/month, 200ms duration, 512MB memory
-- S3 Standard in us-east-1: 100GB storage, 10K PUT requests, 100K GET requests
+search_services → get_service_fields → create_estimate → add_service → export_estimate → refresh_estimate
 ```
 
-The agent will call `configure_service` for each service to get the calculated costs, then `create_estimate` to save and get a shareable link. **Costs are calculated automatically using real-time AWS pricing data.**
+| Tool | What it does |
+|------|-------------|
+| `search_services` | Find services by keyword. Comma-separated multi-search. |
+| `get_service_fields` | Get field IDs, types, valid options for any service. |
+| `create_estimate` | Create an empty estimate. Returns an ID. |
+| `add_service` | Add configured services to an estimate. Validates all field IDs. |
+| `update_service` | Modify a service's config in-place. No rebuild needed. |
+| `export_estimate` | Push to calculator.aws. Returns a shareable URL. |
+| `refresh_estimate` | **Headless Chrome** — opens the URL, clicks "Update estimate", returns real costs. |
+| `generate_report` | Full breakdown: navigates into each group, gets per-service costs, merges with config, outputs CSV or Markdown. |
 
-### Load and inspect an existing estimate
+### Import & Management
+
+| Tool | What it does |
+|------|-------------|
+| `import_estimate` | Download any estimate by URL or ID. JSON or Markdown output. |
+| `list_estimates` | List all in-memory estimates. |
+| `delete_estimate` | Remove an estimate from memory. |
+| `get_server_info` | Version, capabilities, partition support. |
+
+## Example
+
+**Prompt:**
+> Create an estimate for a production web app in us-west-2: 2x c5.xlarge EC2 with Savings Plan, Lambda at 20M requests, S3 500GB, CloudFront 1TB.
+
+**What happens:**
 
 ```
-Load this estimate: https://calculator.aws/#/estimate?id=abc123...
+search_services("Lambda, S3, CloudFront")     → service keys
+get_service_fields("aWSLambda, amazonS3...")   → field IDs + valid values
+create_estimate("Production Stack")            → estimate_id
+add_service(estimate_id, [...4 services...])   → ✓ added, 4 total
+export_estimate(estimate_id)                   → https://calculator.aws/#/estimate?id=...
+refresh_estimate(url)                          → $333.92/mo (actual AWS-calculated)
+generate_report(url, "markdown")               → full breakdown with per-service costs
 ```
 
-### Get service configuration fields
+**Output:**
 
 ```
-What input fields does Amazon EC2 have in the pricing calculator?
+| Service | Monthly | Annual |
+|---------|---------|--------|
+| Amazon EC2 (2x c5.xlarge, Savings Plan) | $148.20 | $1,778.40 |
+| AWS Lambda (20M req, 256MB, 500ms) | $78.18 | $938.16 |
+| Amazon S3 Standard (500GB) | $14.03 | $168.36 |
+| Amazon CloudFront (1TB) | $93.51 | $1,122.12 |
+| **Total** | **$333.92** | **$4,007.04** |
 ```
 
-The agent will call `get_service_schema` with `serviceCode: "eC2Next"` and return all configurable fields.
+The link is editable — anyone can open it and modify the configuration on calculator.aws.
 
-## How it works
+## EC2 Shorthand
 
-The server calls calculator.aws's internal REST APIs (no authentication required):
+EC2 uses a special config format (don't call `get_service_fields` for it):
 
-| Operation | Endpoint |
-|-----------|----------|
-| Save estimate | `POST https://dnd5zrqcec4or.cloudfront.net/Prod/v2/saveAs` |
-| Load estimate | `GET https://d3knqfixx3sbls.cloudfront.net/{id}` |
-| Service definitions | `GET https://d1qsjq9pzbk1k6.cloudfront.net/data/{serviceCode}/en_US.json` |
-| Service manifest | `GET https://d1qsjq9pzbk1k6.cloudfront.net/manifest/en_US.json` |
-| Pricing data | `GET https://calculator.aws/pricing/2.0/meteredUnitMaps/{service}/USD/current/{service}.json` |
+```json
+{
+  "service": "ec2Enhancement",
+  "config": {
+    "region": "us-west-2",
+    "instanceType": "c5.xlarge",
+    "selectedOS": "linux",
+    "tenancy": "shared",
+    "pricingStrategy": "computeSavings1yrNoUpfront",
+    "quantity": "2",
+    "storageType": "gp3",
+    "storageAmount": {"value": "50", "unit": "gb|NA"}
+  }
+}
+```
 
-### Pricing calculation engine
+Pricing strategies: `ondemand`, `computeSavings1yrNoUpfront`, `computeSavings3yrAllUpfront`, `instanceSavings1yrPartialUpfront`, etc.
 
-For each service, the server:
-1. Fetches the service definition to get the schema, pricing formulas, and default values
-2. Fetches real-time pricing data from the AWS pricing API
-3. Builds `calculationComponents` from defaults merged with user-provided values
-4. Resolves pricing components (metered unit lookups, tiered pricing, single price points)
-5. Executes the `mathsSection` formulas — the same calculation logic used by the AWS Calculator frontend
-6. Returns the calculated monthly and upfront costs
+## Sub-Services
 
-The calculation engine supports:
-- **Basic math**: multiplication, addition, subtraction, division
-- **Tiered pricing**: automatic tier boundary calculations (e.g., S3 storage tiers)
-- **Free tier deductions**: proper free tier handling (e.g., Lambda free 1M requests + 400K GB-seconds)
-- **Unit conversions**: MB↔GB↔TB for storage, per-second↔per-month for frequencies
-- **Conditional pricing**: `displayIf` conditions for feature-specific pricing (e.g., Lambda ARM vs x86)
-- **Savings plans / pricing strategies**: EC2 pricing model selection (Instance Savings Plans, Compute Savings Plans, Reserved, On-Demand)
+Services like ELB, VPC, and Backup have sub-services. Use them directly:
 
-### Editability
+```json
+{"service": "applicationLoadBalancer"}
+{"service": "networkAddressTranslationNatGatewayVpc"}
+{"service": "ebsBackup"}
+```
 
-Estimates are fully editable when opened in the browser. The server includes:
-- `templateId`: tells the calculator which configuration form to show (e.g., "lambdaWithFreeTier", "CDN", "quickEstimate")
-- `calculationComponents`: all input field values that populate the edit form
-- `version`: matching service definition version to prevent stale data warnings
+Or pass the parent with `instance` — it auto-resolves:
 
-Services with multiple templates (e.g., Lambda "Include Free Tier" vs "Without Free Tier", CloudFront "Flat Rate" vs "Pay as you go") default to the first template. Use the `templateId` parameter in `create_estimate` to select a specific template.
+```json
+{"service": "elasticLoadBalancing", "instance": "applicationLoadBalancer"}
+```
 
-## Limitations
+## Iterating on Costs
 
-- **Internal APIs**: These are undocumented calculator.aws endpoints. They could change without notice.
-- **Pricing accuracy**: The calculation engine handles most common pricing patterns (basic math, tiered pricing, single price points). Some complex service-specific pricing models may not calculate perfectly — in those cases, costs default to $0 and can be manually specified.
-- **Estimate expiry**: Calculator.aws estimates expire after 1 year.
+Need to hit a specific budget? Don't rebuild — update in place:
+
+```
+add_service(...)           → build the estimate
+export + refresh           → see actual costs ($575)
+update_service(rds, {"storageAmount": {"value": "200", "unit": "gb|NA"}})
+export + refresh           → $589.86 ✓
+```
+
+## Partitions
+
+Supports all AWS partitions:
+
+| Partition | Regions |
+|-----------|---------|
+| `aws` (default) | All commercial regions |
+| `aws-iso` | us-iso-east-1, us-iso-west-1 |
+| `aws-iso-b` | us-isob-east-1 |
+
+## Requirements
+
+- **Node.js** ≥ 18
+- **Chrome/Chromium** — for `refresh_estimate` and `generate_report` (auto-detected, or `npm install puppeteer` to bundle one)
+
+## Architecture
+
+```
+mcp-server.js              → 12 MCP tools, validation, routing
+lib/aws-client.js          → CalculatorAPI class: catalog, schemas, persist, download
+lib/estimate-builder.js    → Estimate class: incremental building, serialization, export
+lib/ec2.js                 → EC2 config transformation (agent-friendly → calculator format)
+lib/browser.js             → Headless Chrome: refresh costs, navigate groups, scrape tables
+```
 
 ## License
 
