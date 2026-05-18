@@ -15,7 +15,39 @@ Works with any MCP client: [Kiro](https://kiro.dev), Claude Desktop, Cursor, VS 
 | **Typo detection** | Invalid field IDs return suggestions: `"storagAmount" → did you mean "storageAmount"?` | Silent failures |
 | **Full reports** | CSV/Markdown with MRR, ARR, per-service costs + all configured attributes | Just a URL |
 
-## Quick Start
+## One-Click Install
+
+Just add this to your MCP client config. No cloning, no setup, no build step:
+
+```json
+{
+  "mcpServers": {
+    "aws-calculator": {
+      "command": "npx",
+      "args": ["-y", "aws-calculator-mcp@latest"]
+    }
+  }
+}
+```
+
+That's it. `npx` downloads and runs it automatically.
+
+> If the npm package isn't published yet, use the GitHub URL directly:
+> ```json
+> "args": ["-y", "github:Musheer360/aws-calculator-mcp"]
+> ```
+
+### Where to put this config
+
+| Client | Config file |
+|--------|------------|
+| **Kiro CLI** | `~/.kiro/settings/mcp.json` |
+| **Claude Desktop (macOS)** | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| **Claude Desktop (Windows)** | `%APPDATA%\Claude\claude_desktop_config.json` |
+| **Cursor** | `.cursor/mcp.json` in your project |
+| **VS Code** | `.vscode/mcp.json` in your project |
+
+### Alternative: Clone and run locally
 
 ```bash
 git clone https://github.com/Musheer360/aws-calculator-mcp.git
@@ -23,64 +55,34 @@ cd aws-calculator-mcp
 npm install
 ```
 
-Verify it works:
+Then point your config to the absolute path:
+
+```json
+{
+  "mcpServers": {
+    "aws-calculator": {
+      "command": "node",
+      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
+    }
+  }
+}
+```
+
+### Verify it works
 
 ```bash
-node mcp-server.js <<< '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+npx aws-calculator-mcp <<< '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
 ```
 
-You should see a JSON response with `serverInfo`. If you get an error, check Node.js ≥ 18 (`node --version`).
-
-### MCP Client Config
-
-**Kiro CLI** — add to `~/.kiro/settings/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "aws-calculator": {
-      "command": "node",
-      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
-    }
-  }
-}
-```
-
-**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "aws-calculator": {
-      "command": "node",
-      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
-    }
-  }
-}
-```
-
-**Cursor / VS Code** — add to `.cursor/mcp.json` or `.vscode/mcp.json` in your project:
-
-```json
-{
-  "servers": {
-    "aws-calculator": {
-      "command": "node",
-      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
-    }
-  }
-}
-```
-
-> ⚠️ **Use the absolute path** to `mcp-server.js`. Relative paths won't work because MCP clients launch the server from their own working directory.
+You should see a JSON response with `serverInfo`.
 
 ### Chrome (optional)
 
-`refresh_estimate` and `generate_report` need Chrome/Chromium. Three options:
+`refresh_estimate` and `generate_report` need Chrome. Three options:
 
-1. **Auto-bundled** (easiest) — `npm install puppeteer` inside the project. Downloads Chromium automatically.
-2. **System Chrome** — if Chrome/Chromium is installed on your system, it's auto-detected.
-3. **Skip it** — the other 10 tools work without Chrome. You just won't get actual dollar amounts.
+1. **System Chrome** — if Chrome/Chromium is installed, it's auto-detected.
+2. **Bundled** — run `npx puppeteer browsers install chrome` to download Chromium.
+3. **Skip it** — the other 10 tools work fine without Chrome.
 
 No AWS credentials needed. No API keys. No account required.
 
@@ -210,18 +212,13 @@ Supports all AWS partitions:
 
 ## Troubleshooting
 
-**MCP fails to load / "Cannot find module"**
-- Use the **absolute path** to `mcp-server.js` in your config
-- Run `npm install` inside the cloned directory
-- Check `node --version` is ≥ 18
-
-**"No Chrome/Chromium found"**
-- Run `npm install puppeteer` inside the project (downloads Chromium ~280MB)
-- Or install Chrome/Chromium on your system
-
-**Server starts but tools timeout**
-- The first call fetches the AWS service catalog (~2s). Subsequent calls are cached.
-- `refresh_estimate` takes 15-30s (opens a real browser)
+| Problem | Fix |
+|---------|-----|
+| MCP fails to load | Check `node --version` is ≥ 18. Use absolute path if running locally. |
+| "Cannot find module" | Run `npm install` in the project directory. |
+| "No Chrome/Chromium found" | Run `npx puppeteer browsers install chrome` or install Chrome on your system. |
+| First call is slow | Normal — fetches the AWS service catalog (~2s). Cached after that. |
+| `refresh_estimate` takes 20s+ | Normal — opens a real browser, waits for page render. |
 
 ## Architecture
 

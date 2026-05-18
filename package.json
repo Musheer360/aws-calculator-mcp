@@ -3,9 +3,14 @@
   "version": "2.0.0",
   "description": "MCP server for creating, reading, updating AWS Pricing Calculator estimates through natural language.",
   "main": "mcp-server.js",
-  "bin": "dist/mcp-server.js",
+  "bin": {
+    "aws-calculator-mcp": "mcp-server.js"
+  },
   "files": [
-    "dist/mcp-server.js"
+    "mcp-server.js",
+    "lib/",
+    "LICENSE",
+    "README.md"
   ],
   "license": "MIT",
   "author": "Musheer360",
@@ -18,15 +23,16 @@
     "aws",
     "pricing",
     "calculator",
-    "estimate"
+    "estimate",
+    "cost",
+    "model-context-protocol"
   ],
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "mcp": "node mcp-server.js",
-    "build": "esbuild mcp-server.js --bundle --platform=node --outfile=dist/mcp-server.js --format=cjs --minify"
+    "start": "node mcp-server.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -34,8 +40,5 @@
   },
   "optionalDependencies": {
     "puppeteer": "^25.0.0"
-  },
-  "devDependencies": {
-    "esbuild": "^0.27.4"
   }
 }
