@@ -23,20 +23,64 @@ cd aws-calculator-mcp
 npm install
 ```
 
+Verify it works:
+
+```bash
+node mcp-server.js <<< '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0.0"}}}'
+```
+
+You should see a JSON response with `serverInfo`. If you get an error, check Node.js ≥ 18 (`node --version`).
+
 ### MCP Client Config
 
-Add to your MCP settings (e.g. `~/.kiro/settings/mcp.json`, Claude Desktop config, etc.):
+**Kiro CLI** — add to `~/.kiro/settings/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "aws-calculator": {
       "command": "node",
-      "args": ["/path/to/aws-calculator-mcp/mcp-server.js"]
+      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
     }
   }
 }
 ```
+
+**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "aws-calculator": {
+      "command": "node",
+      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
+    }
+  }
+}
+```
+
+**Cursor / VS Code** — add to `.cursor/mcp.json` or `.vscode/mcp.json` in your project:
+
+```json
+{
+  "servers": {
+    "aws-calculator": {
+      "command": "node",
+      "args": ["/absolute/path/to/aws-calculator-mcp/mcp-server.js"]
+    }
+  }
+}
+```
+
+> ⚠️ **Use the absolute path** to `mcp-server.js`. Relative paths won't work because MCP clients launch the server from their own working directory.
+
+### Chrome (optional)
+
+`refresh_estimate` and `generate_report` need Chrome/Chromium. Three options:
+
+1. **Auto-bundled** (easiest) — `npm install puppeteer` inside the project. Downloads Chromium automatically.
+2. **System Chrome** — if Chrome/Chromium is installed on your system, it's auto-detected.
+3. **Skip it** — the other 10 tools work without Chrome. You just won't get actual dollar amounts.
 
 No AWS credentials needed. No API keys. No account required.
 
@@ -160,8 +204,24 @@ Supports all AWS partitions:
 
 ## Requirements
 
-- **Node.js** ≥ 18
-- **Chrome/Chromium** — for `refresh_estimate` and `generate_report` (auto-detected, or `npm install puppeteer` to bundle one)
+- **Node.js** ≥ 18 — check with `node --version`
+- **npm** — comes with Node.js
+- **Chrome/Chromium** (optional) — only for `refresh_estimate` and `generate_report`. Run `npm install puppeteer` to auto-download, or use system Chrome.
+
+## Troubleshooting
+
+**MCP fails to load / "Cannot find module"**
+- Use the **absolute path** to `mcp-server.js` in your config
+- Run `npm install` inside the cloned directory
+- Check `node --version` is ≥ 18
+
+**"No Chrome/Chromium found"**
+- Run `npm install puppeteer` inside the project (downloads Chromium ~280MB)
+- Or install Chrome/Chromium on your system
+
+**Server starts but tools timeout**
+- The first call fetches the AWS service catalog (~2s). Subsequent calls are cached.
+- `refresh_estimate` takes 15-30s (opens a real browser)
 
 ## Architecture
 
