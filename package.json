@@ -1,7 +1,7 @@
 {
   "name": "aws-calculator-mcp",
   "version": "2.0.0",
-  "description": "MCP server for creating, reading, updating AWS Pricing Calculator estimates through natural language.",
+  "description": "MCP server for AWS Pricing Calculator — create estimates, get shareable links, and retrieve actual AWS-calculated costs. Supports all 400+ AWS services, EC2 Savings Plans, sub-service resolution, and headless browser cost verification.",
   "main": "mcp-server.js",
   "bin": {
     "aws-calculator-mcp": "mcp-server.js"
@@ -13,19 +13,35 @@
     "README.md"
   ],
   "license": "MIT",
-  "author": "Musheer360",
+  "author": {
+    "name": "Musheer360",
+    "url": "https://github.com/Musheer360"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Musheer360/aws-calculator-mcp"
+    "url": "git+https://github.com/Musheer360/aws-calculator-mcp.git"
   },
+  "bugs": {
+    "url": "https://github.com/Musheer360/aws-calculator-mcp/issues"
+  },
+  "homepage": "https://github.com/Musheer360/aws-calculator-mcp#readme",
   "keywords": [
     "mcp",
+    "model-context-protocol",
     "aws",
     "pricing",
     "calculator",
     "estimate",
     "cost",
-    "model-context-protocol"
+    "cloud",
+    "ec2",
+    "lambda",
+    "s3",
+    "ai",
+    "agent",
+    "claude",
+    "kiro",
+    "cursor"
   ],
   "engines": {
     "node": ">=18.0.0"

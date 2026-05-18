@@ -32,11 +32,6 @@ Just add this to your MCP client config. No cloning, no setup, no build step:
 
 That's it. `npx` downloads and runs it automatically.
 
-> If the npm package isn't published yet, use the GitHub URL directly:
-> ```json
-> "args": ["-y", "github:Musheer360/aws-calculator-mcp"]
-> ```
-
 ### Where to put this config
 
 | Client | Config file |
