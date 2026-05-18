@@ -11,6 +11,27 @@ const ESTIMATE_TTL_MS = 3600000; // 1 hour
 const ESTIMATE_MAX = 50;
 const META_KEYS = new Set(['region', 'description']);
 
+// Known critical fields — if these are missing, the estimate will likely show $0 or wrong costs
+const CRITICAL_FIELDS = {
+  awslambda: { required: ['numberOfRequests'], recommended: ['durationOfEachRequest', 'sizeOfMemoryAllocated'], msg: 'Lambda without duration and memory will show $0 execution cost.' },
+  amazons3standard: { required: ['s3StandardStorageSize'], recommended: [], msg: 'S3 without storage size will show $0.' },
+  amazoncloudfront: { required: [], recommended: ['dataTransferedToInternet_US'], msg: 'CloudFront without data transfer will show $0.' },
+};
+
+function checkMissingFields(serviceKey, config) {
+  const spec = CRITICAL_FIELDS[serviceKey.toLowerCase()];
+  if (!spec) return null;
+  const configKeys = Object.keys(config).filter(k => !META_KEYS.has(k));
+  const missingRequired = spec.required.filter(f => !configKeys.includes(f));
+  const missingRecommended = spec.recommended.filter(f => !configKeys.includes(f));
+  if (!missingRequired.length && !missingRecommended.length) return null;
+  const parts = [];
+  if (missingRequired.length) parts.push(`Missing required: ${missingRequired.join(', ')}`);
+  if (missingRecommended.length) parts.push(`Missing recommended: ${missingRecommended.join(', ')}`);
+  parts.push(spec.msg);
+  return parts.join('. ');
+}
+
 function pruneEstimates() {
   const now = Date.now();
   for (const [id, est] of estimates) {
@@ -116,7 +137,13 @@ server.tool('get_service_fields', 'Get input fields for one or more AWS services
   const results = [], errors = [];
   for (const key of keys) {
     const svc = findService(manifest, key);
-    if (!svc) { errors.push(`Service "${key}" not found.`); continue; }
+    if (!svc) {
+      // Fuzzy match: suggest closest service keys
+      const allKeys = [...manifest.keys()];
+      const suggestions = suggestMatch(key, allKeys, 3);
+      errors.push(suggestions.length ? `Service "${key}" not found. Did you mean: ${suggestions.join(', ')}?` : `Service "${key}" not found. Use search_services to find valid keys.`);
+      continue;
+    }
     const definition = await fetchServiceDefinition(manifest, svc.key, p);
     if (!definition) { errors.push(`Failed to fetch definition for "${svc.key}".`); continue; }
     const fields = extractInputFields(definition);
@@ -198,7 +225,9 @@ Config keys are validated against the service definition with typo detection.`, 
     const validationError = await validateConfigKeys(resolvedKey, config, estimate.partition);
     if (validationError) { results.push({ error: validationError, service: resolvedKey }); continue; }
     estimate.addService(resolvedKey, config, { group });
-    results.push({ success: true, service: resolvedKey, group: group || '(ungrouped)', description: config.description || null });
+    // Warn about missing critical fields for known services
+    const warn = checkMissingFields(resolvedKey, config);
+    results.push({ success: true, service: resolvedKey, group: group || '(ungrouped)', description: config.description || null, ...(warn && { warning: warn }) });
   }
   const total = estimateServiceCount(estimate);
   return { content: [{ type: 'text', text: JSON.stringify({ added: results, estimate_total_services: total, hint: 'Use export_estimate then refresh_estimate to get actual costs.' }, null, 2) }] };
