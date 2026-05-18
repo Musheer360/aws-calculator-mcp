@@ -1,19 +1,41 @@
 {
   "name": "aws-calculator-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for creating AWS Pricing Calculator estimates with shareable links",
-  "type": "module",
-  "bin": { "aws-calculator-mcp": "./index.js" },
+  "version": "2.0.0",
+  "description": "MCP server for creating, reading, updating AWS Pricing Calculator estimates through natural language.",
+  "main": "mcp-server.js",
+  "bin": "dist/mcp-server.js",
+  "files": [
+    "dist/mcp-server.js"
+  ],
   "license": "MIT",
   "author": "Musheer360",
   "repository": {
     "type": "git",
     "url": "https://github.com/Musheer360/aws-calculator-mcp"
   },
-  "keywords": ["mcp", "aws", "pricing", "calculator", "estimate"],
-  "engines": { "node": ">=18.0.0" },
+  "keywords": [
+    "mcp",
+    "aws",
+    "pricing",
+    "calculator",
+    "estimate"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "mcp": "node mcp-server.js",
+    "build": "esbuild mcp-server.js --bundle --platform=node --outfile=dist/mcp-server.js --format=cjs --minify"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "zod": "^3.25.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "puppeteer-core": "^25.0.2"
+  },
+  "optionalDependencies": {
+    "puppeteer": "^25.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.4"
   }
 }
