@@ -144,8 +144,12 @@ server.tool('get_service_fields', 'Get input fields for one or more AWS services
       errors.push(suggestions.length ? `Service "${key}" not found. Did you mean: ${suggestions.join(', ')}?` : `Service "${key}" not found. Use search_services to find valid keys.`);
       continue;
     }
-    const definition = await fetchServiceDefinition(manifest, svc.key, p);
-    if (!definition) { errors.push(`Failed to fetch definition for "${svc.key}".`); continue; }
+    const definition = await fetchServiceDefinition(manifest, svc.key, p).catch(async () => {
+      // Retry once after 2s on failure
+      await new Promise(r => setTimeout(r, 2000));
+      return fetchServiceDefinition(manifest, svc.key, p).catch(() => null);
+    });
+    if (!definition) { errors.push(`Failed to fetch definition for "${svc.key}". Try again.`); continue; }
     const fields = extractInputFields(definition);
     const enriched = await enrichFieldsWithMetadata(definition, fields);
     results.push({ serviceCode: svc.key, serviceName: svc.name, fields: enriched });
@@ -194,6 +198,7 @@ server.tool('add_service', `Add one or more AWS services to an estimate. Field v
 - fileSize: object with value and unit, e.g. {"value": "512", "unit": "mb|NA"}
 - dropdown: string matching one of the option IDs from get_service_fields
 - durationInput: object with value and unit, e.g. {"value": "960", "unit": "min"}
+- dataTransferV2: array of transfer entries. Format: [{"entryType":"OUTBOUND","value":"500","unit":"gb_month","toRegion":"External"},{"entryType":"INBOUND","value":"","unit":"tb_month","fromRegion":""},{"entryType":"INTRA_REGION","value":"","unit":"gb_month"}]. Use "External" for internet, or a region code for inter-region.
 - pricingStrategy (EC2 only): object with model, term, upfrontPayment keys
 Amazon EC2 (ec2Enhancement) has special config fields: instanceType, selectedOS, tenancy, pricingStrategy, quantity, storageType, storageAmount, snapshotFrequency, gp3Iops, gp3Throughput, iops, iops2, storageAmountIo2. Do NOT use get_service_fields for EC2.
 Sub-services: Use the sub-service key directly (e.g. "applicationLoadBalancer" not "elasticLoadBalancing" with instance). Or pass instance and the parent will be resolved automatically.
@@ -240,7 +245,7 @@ server.tool('export_estimate', 'Export an estimate to calculator.aws and get a s
   if (!estimate) return { content: [{ type: 'text', text: `Estimate "${estimate_id}" not found. It may have expired (estimates expire after 1 hour).` }], isError: true };
   try {
     const result = await estimate.export();
-    return { content: [{ type: 'text', text: JSON.stringify({ sharable_url: result.shareableUrl, aws_estimate_id: result.estimateId }) }] };
+    return { content: [{ type: 'text', text: JSON.stringify({ sharable_url: result.shareableUrl, aws_estimate_id: result.estimateId, note: 'Costs take ~15-30s to propagate. Wait before calling refresh_estimate.' }) }] };
   } catch (err) { return { content: [{ type: 'text', text: `Export failed: ${err.message}` }], isError: true }; }
 });
 
@@ -347,12 +352,18 @@ server.tool('delete_estimate', 'Delete an in-memory estimate by ID.', {
   return { content: [{ type: 'text', text: `Estimate "${estimate_id}" deleted.` }] };
 });
 
-server.tool('refresh_estimate', 'Open an estimate URL in a headless browser, trigger cost recalculation, and return the updated pricing. This is the ONLY way to get actual dollar amounts — the API does not calculate costs. Requires Chrome/Chromium on the system (or `npm i puppeteer` for bundled Chrome).', {
+server.tool('refresh_estimate', 'Open an estimate URL in a headless browser, trigger cost recalculation, and return the updated pricing. This is the ONLY way to get actual dollar amounts — the API does not calculate costs. Automatically retries once after 15s if costs show $0 (propagation delay). Requires Chrome/Chromium.', {
   estimate_url: z.string().describe('Full calculator.aws estimate URL (e.g. "https://calculator.aws/#/estimate?id=abc123")'),
 }, async ({ estimate_url }) => {
   try {
     const { refreshEstimate } = require('./lib/browser');
-    const result = await refreshEstimate(estimate_url);
+    let result = await refreshEstimate(estimate_url);
+    // Propagation retry: if costs are $0 but services exist, wait and retry
+    if (result.success && result.data.monthlyCost === 0 && result.data.services.length > 0) {
+      console.error('[refresh] $0 detected with services present — waiting 15s for propagation...');
+      await new Promise(r => setTimeout(r, 15000));
+      result = await refreshEstimate(estimate_url);
+    }
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {
     return { content: [{ type: 'text', text: `Refresh failed: ${err.message}` }], isError: true };
