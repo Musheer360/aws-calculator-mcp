@@ -358,11 +358,14 @@ server.tool('refresh_estimate', 'Open an estimate URL in a headless browser, tri
   try {
     const { refreshEstimate } = require('./lib/browser');
     let result = await refreshEstimate(estimate_url);
-    // Propagation retry: if costs are $0 but services exist, wait and retry
+    // Propagation retry: exponential backoff if costs are $0 but services exist
     if (result.success && result.data.monthlyCost === 0 && result.data.services.length > 0) {
-      console.error('[refresh] $0 detected with services present — waiting 15s for propagation...');
-      await new Promise(r => setTimeout(r, 15000));
-      result = await refreshEstimate(estimate_url);
+      for (const delay of [5000, 10000, 20000]) {
+        console.error(`[refresh] $0 detected — retrying in ${delay / 1000}s...`);
+        await new Promise(r => setTimeout(r, delay));
+        result = await refreshEstimate(estimate_url);
+        if (result.data.monthlyCost > 0) break;
+      }
     }
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
   } catch (err) {

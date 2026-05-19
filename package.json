@@ -1,6 +1,6 @@
 {
   "name": "aws-calculator-mcp",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "MCP server for AWS Pricing Calculator — create estimates, get shareable links, and retrieve actual AWS-calculated costs. Supports all 400+ AWS services, EC2 Savings Plans, sub-service resolution, and headless browser cost verification.",
   "main": "mcp-server.js",
   "bin": {
