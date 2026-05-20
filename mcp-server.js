@@ -112,10 +112,6 @@ async function validateConfigKeys(serviceKey, config, partition) {
 const pkg = require('./package.json');
 const server = new McpServer({ name: pkg.name, version: pkg.version });
 
-server.tool('get_server_info', 'Get version and capability information about this MCP server.', {}, async () => {
-  return { content: [{ type: 'text', text: JSON.stringify({ name: pkg.name, version: pkg.version, description: pkg.description, tools: ['search_services', 'get_service_fields', 'create_estimate', 'add_service', 'update_service', 'export_estimate', 'generate_report', 'import_estimate', 'refresh_estimate', 'list_estimates', 'delete_estimate', 'get_server_info'], partitions: Object.keys(PARTITIONS) }, null, 2) }] };
-});
-
 server.tool('search_services', 'Search AWS services available in the calculator. Returns service keys and names. Supports multiple comma-separated search terms (e.g. "Lambda, S3, API Gateway").', {
   query: z.string().describe('One or more search terms, comma-separated'),
   partition: z.string().optional().describe('AWS partition (default: "aws"). Valid: "aws", "aws-iso", "aws-iso-b"'),
@@ -330,26 +326,6 @@ server.tool('import_estimate', 'Download an existing AWS Pricing Calculator esti
     const output = (format === 'markdown') ? estimateToMarkdown(data) : JSON.stringify(data, null, 2);
     return { content: [{ type: 'text', text: output }] };
   } catch (err) { return { content: [{ type: 'text', text: `Import failed: ${err.message}` }], isError: true }; }
-});
-
-server.tool('list_estimates', 'List all in-memory estimates with their IDs, names, and service counts.', {}, async () => {
-  pruneEstimates();
-  const list = [...estimates.entries()].map(([id, est]) => ({
-    estimate_id: id,
-    name: est.name,
-    services: Object.keys(est.services).length,
-    groups: Object.keys(est.groups).length,
-    created: new Date(est._createdAt).toISOString(),
-  }));
-  return { content: [{ type: 'text', text: JSON.stringify(list, null, 2) }] };
-});
-
-server.tool('delete_estimate', 'Delete an in-memory estimate by ID.', {
-  estimate_id: z.string().describe('Estimate ID to delete'),
-}, async ({ estimate_id }) => {
-  if (!estimates.has(estimate_id)) return { content: [{ type: 'text', text: `Estimate "${estimate_id}" not found.` }], isError: true };
-  estimates.delete(estimate_id);
-  return { content: [{ type: 'text', text: `Estimate "${estimate_id}" deleted.` }] };
 });
 
 server.tool('refresh_estimate', 'Open an estimate URL in a headless browser, trigger cost recalculation, and return the updated pricing. This is the ONLY way to get actual dollar amounts — the API does not calculate costs. Automatically retries once after 15s if costs show $0 (propagation delay). Requires Chrome/Chromium.', {
