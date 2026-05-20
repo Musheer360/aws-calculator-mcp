@@ -1,6 +1,6 @@
 {
   "name": "aws-calculator-mcp",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "MCP server for AWS Pricing Calculator — create estimates, get shareable links, and retrieve actual AWS-calculated costs. Supports all 400+ AWS services, EC2 Savings Plans, sub-service resolution, and headless browser cost verification.",
   "main": "mcp-server.js",
   "bin": {
@@ -27,21 +27,28 @@
   "homepage": "https://github.com/Musheer360/aws-calculator-mcp#readme",
   "keywords": [
     "mcp",
+    "mcp-server",
     "model-context-protocol",
     "aws",
-    "pricing",
-    "calculator",
-    "estimate",
-    "cost",
-    "cloud",
+    "aws-pricing",
+    "aws-calculator",
+    "pricing-calculator",
+    "cost-estimation",
+    "cloud-pricing",
+    "finops",
     "ec2",
     "lambda",
     "s3",
+    "rds",
+    "bedrock",
+    "savings-plans",
+    "reserved-instances",
     "ai",
     "agent",
     "claude",
     "kiro",
-    "cursor"
+    "cursor",
+    "vscode"
   ],
   "engines": {
     "node": ">=18.0.0"

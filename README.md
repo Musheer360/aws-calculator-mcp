@@ -1,8 +1,14 @@
 # aws-calculator-mcp
 
-[Model Context Protocol](https://modelcontextprotocol.io) server for [AWS Pricing Calculator](https://calculator.aws). Creates estimates programmatically, exports shareable links, and retrieves calculated costs via headless browser.
+[![npm version](https://img.shields.io/npm/v/aws-calculator-mcp)](https://www.npmjs.com/package/aws-calculator-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Covers all 436 services across 72 regions. No AWS credentials required.
+AWS Pricing Calculator MCP server. Create estimates, get shareable calculator.aws links, and retrieve actual AWS-calculated costs — all through natural language via any MCP client.
+
+- **436 services** across **72 regions** — EC2, Lambda, RDS, Bedrock, S3, and everything else on calculator.aws
+- **Real pricing** — uses headless Chrome to get actual AWS-calculated costs, not approximations
+- **Savings Plans & Reserved Instances** — full support for all pricing models
+- **No AWS credentials required** — works without an account
 
 ## Install
 
