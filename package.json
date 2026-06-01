@@ -63,5 +63,8 @@
   },
   "optionalDependencies": {
     "puppeteer": "^25.0.0"
+  },
+  "devDependencies": {
+    "puppeteer": "^25.0.4"
   }
 }
